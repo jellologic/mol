@@ -150,6 +150,18 @@ pub fn a_ret(out: &mut Vec<u8>) {
     w32(0xd65f_03c0, out);
 }
 
+/// `stp x29, x30, [sp, #-16]!` (clang: `a9bf7bfd`).
+#[cfg(target_arch = "aarch64")]
+pub fn a_stp_frame(out: &mut Vec<u8>) {
+    w32(0xa9bf_7bfd, out);
+}
+
+/// `ldp x29, x30, [sp], #16` (clang: `a8c17bfd`).
+#[cfg(target_arch = "aarch64")]
+pub fn a_ldp_frame(out: &mut Vec<u8>) {
+    w32(0xa8c1_7bfd, out);
+}
+
 /// ldr dd, [xn].
 #[cfg(target_arch = "aarch64")]
 pub fn a_ldr_d(out: &mut Vec<u8>, rd: u32, rn: u32) {
@@ -361,6 +373,12 @@ pub fn x_xor_r9d(out: &mut Vec<u8>) {
 #[cfg(target_arch = "x86_64")]
 pub fn x_sub_rsp_8(out: &mut Vec<u8>) {
     out.extend_from_slice(&[0x48, 0x83, 0xec, 0x08]);
+}
+
+/// `add rsp, 8`: balances `x_sub_rsp_8` before `ret`.
+#[cfg(target_arch = "x86_64")]
+pub fn x_add_rsp_8(out: &mut Vec<u8>) {
+    out.extend_from_slice(&[0x48, 0x83, 0xc4, 0x08]);
 }
 
 /// lea r64, [rip+disp]: rax=0 rcx=1 rdx=2 rbx=3 rsi=6 rdi=7 r8=8 ...
@@ -593,15 +611,15 @@ pub fn x_ret(out: &mut Vec<u8>) {
 
 // --- Mach-O builder ---
 
-const MH_MAGIC_64: u32 = 0xfeed_facf;
-const MH_EXECUTE: u32 = 2;
-const MH_PIE: u32 = 0x20_0000;
-const LC_SEGMENT_64: u32 = 0x19;
-const LC_LOAD_DYLIB: u32 = 0xc;
-const LC_DYLD_CHAINED_FIXUPS: u32 = 0x8000_0034;
-const LC_MAIN: u32 = 0x8000_0028;
+pub const MH_MAGIC_64: u32 = 0xfeed_facf;
+pub const MH_EXECUTE: u32 = 2;
+pub const MH_PIE: u32 = 0x20_0000;
+pub const LC_SEGMENT_64: u32 = 0x19;
+pub const LC_LOAD_DYLIB: u32 = 0xc;
+pub const LC_DYLD_CHAINED_FIXUPS: u32 = 0x8000_0034;
+pub const LC_MAIN: u32 = 0x8000_0028;
 
-fn cmd(code: u32, payload: &[u8]) -> Vec<u8> {
+pub fn cmd(code: u32, payload: &[u8]) -> Vec<u8> {
     let size = ((8 + payload.len()).div_ceil(8) * 8) as u32;
     let mut v = Vec::new();
     v.extend_from_slice(&code.to_le_bytes());
@@ -630,7 +648,51 @@ fn segment(
     cmd(LC_SEGMENT_64, &p)
 }
 
-fn dylib_cmd(name: &str) -> Vec<u8> {
+/// One 80-byte `section_64`.
+pub struct SectionSpec {
+    pub sectname: &'static str,
+    pub segname: &'static str,
+    pub addr: u64,
+    pub size: u64,
+    pub offset: u32,
+}
+
+/// Segment command with section headers.
+pub fn segment_sections(
+    name: &str,
+    vmaddr: u64,
+    fileoff: u64,
+    filesize: u64,
+    vmsize: u64,
+    prot: u32,
+    sections: &[SectionSpec],
+) -> Vec<u8> {
+    // 64-byte base (the 72-byte command minus cmd+cmdsize);
+    // sections follow immediately.
+    let mut p = vec![0u8; 64];
+    p[..name.len()].copy_from_slice(name.as_bytes());
+    p[16..24].copy_from_slice(&vmaddr.to_le_bytes());
+    p[24..32].copy_from_slice(&vmsize.to_le_bytes());
+    p[32..40].copy_from_slice(&fileoff.to_le_bytes());
+    p[40..48].copy_from_slice(&filesize.to_le_bytes());
+    p[48..52].copy_from_slice(&7u32.to_le_bytes());
+    p[52..56].copy_from_slice(&prot.to_le_bytes());
+    // nsects at payload 56 (file 64: `cmd` prepends cmd+cmdsize).
+    p[56..60].copy_from_slice(&(sections.len() as u32).to_le_bytes());
+    for s in sections {
+        let mut h = vec![0u8; 80];
+        h[..s.sectname.len()].copy_from_slice(s.sectname.as_bytes());
+        h[16..16 + s.segname.len()].copy_from_slice(s.segname.as_bytes());
+        h[32..40].copy_from_slice(&s.addr.to_le_bytes());
+        h[40..48].copy_from_slice(&s.size.to_le_bytes());
+        h[48..52].copy_from_slice(&s.offset.to_le_bytes());
+        h[52..56].copy_from_slice(&12u32.to_le_bytes()); // align 2^12
+        p.extend_from_slice(&h);
+    }
+    cmd(LC_SEGMENT_64, &p)
+}
+
+pub fn dylib_cmd(name: &str) -> Vec<u8> {
     let mut payload = vec![0u8; 16];
     payload[0..4].copy_from_slice(&24u32.to_le_bytes());
     payload.extend_from_slice(name.as_bytes());
@@ -641,7 +703,7 @@ fn dylib_cmd(name: &str) -> Vec<u8> {
 /// Chained-fixups payload: format 6, imports format 1, one bind per
 /// import at GOT slot `i` (stride-correct `next`, mirroring real
 /// `ld` emission: consecutive 8-byte binds use next=2).
-fn chained_payload(imports: &[&str]) -> (Vec<u8>, Vec<u8>) {
+pub fn chained_payload(imports: &[&str]) -> (Vec<u8>, Vec<u8>) {
     let n = imports.len();
     // GOT chain entries.
     let mut got = Vec::new();
@@ -805,6 +867,12 @@ mod tests {
         a_ret(&mut v);
         assert_eq!(v, w(0xd65f_03c0));
         v.clear();
+        a_stp_frame(&mut v);
+        assert_eq!(v, w(0xa9bf_7bfd));
+        v.clear();
+        a_ldp_frame(&mut v);
+        assert_eq!(v, w(0xa8c1_7bfd));
+        v.clear();
         a_cmn_w1(&mut v, 0);
         assert_eq!(v, w(0x3100_041f));
         v.clear();
@@ -928,6 +996,9 @@ mod tests {
         v.clear();
         x_sub_rsp_8(&mut v);
         assert_eq!(v, vec![0x48, 0x83, 0xec, 0x08]);
+        v.clear();
+        x_add_rsp_8(&mut v);
+        assert_eq!(v, vec![0x48, 0x83, 0xc4, 0x08]);
         v.clear();
         x_lea_rip(&mut v, 7, 0x28, 0xa8);
         assert_eq!(v[..3], vec![0x48, 0x8d, 0x3d]);

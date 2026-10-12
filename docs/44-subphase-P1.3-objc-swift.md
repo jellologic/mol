@@ -11,9 +11,11 @@ Proven by: ordering fixture + Swift load test.
 
 Criteria:
 
-- [ ] P1.3.1 ObjC ordering fixture green: superclass-first class
+- [x] P1.3.1 ObjC ordering fixture green: superclass-first class
   `+load`s, category `+load`s after parent, cross-image categories
-  (doc 12 L4).
+  (doc 12 L4). (`mol-objc` schedule/drain per `objc-loadmethod.mm`;
+  loader drains mapped-memory parses between inits and entry via
+  the `call_imp` trampoline.)
 - [ ] P1.3.2 Swift runtime dylibs load and initialize (doc 09 M1).
 - [ ] P1.3.3 `objc_msgSend` ABI differential-clean incl nil-receiver,
   stret/fpret variants, and ARC entry points (`objc_retain` /
@@ -21,5 +23,7 @@ Criteria:
 
 Tests:
 
-- [ ] P1.3.V1 Ordering fixture covers deep hierarchies +
-  cross-image categories (doc 12 L4).
+- [x] P1.3.V1 Ordering fixture covers deep hierarchies +
+  cross-image categories (doc 12 L4). (5 byte-level ordering
+  fixtures with exact `(imp, cls, sel)` sequences + `objc_guest`
+  E2E asserting `RMCE` on both arches.)
