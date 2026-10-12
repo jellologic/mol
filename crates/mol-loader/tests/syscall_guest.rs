@@ -144,6 +144,7 @@ fn t1_code(dv: u64) -> Vec<u8> {
 #[cfg(target_arch = "x86_64")]
 fn t1_code(dv: u64) -> Vec<u8> {
     let mut c = vec![];
+    x_sub_rsp_8(&mut c); // align stack for calls (SysV ABI)
     x_mov_rdi_imm32(&mut c, 1);
     let s = site(&c);
     x_lea_rip(&mut c, 6, s, dv);
@@ -219,6 +220,7 @@ fn t2_code(dv: u64) -> Vec<u8> {
 #[cfg(target_arch = "x86_64")]
 fn t2_code(dv: u64) -> Vec<u8> {
     let mut c = vec![];
+    x_sub_rsp_8(&mut c); // align stack for calls (SysV ABI)
     let s = site(&c);
     x_lea_rip(&mut c, 7, s, dv);
     x_xor_esi(&mut c);
@@ -317,6 +319,7 @@ fn t3_code(dv: u64, buf: u64) -> Vec<u8> {
 #[cfg(target_arch = "x86_64")]
 fn t3_code(dv: u64, buf: u64) -> Vec<u8> {
     let mut c = vec![];
+    x_sub_rsp_8(&mut c); // align stack for calls (SysV ABI)
     let s = site(&c);
     x_lea_rip(&mut c, 7, s, dv);
     x_xor_esi(&mut c);
@@ -435,6 +438,7 @@ fn t4_code() -> Vec<u8> {
 #[cfg(target_arch = "x86_64")]
 fn t4_code() -> Vec<u8> {
     let mut c = vec![];
+    x_sub_rsp_8(&mut c); // align stack for calls (SysV ABI)
     x_xor_edi(&mut c);
     x_mov_esi_imm32(&mut c, 0x1000);
     x_mov_r32_imm(&mut c, 2, 3);
@@ -555,6 +559,7 @@ fn t5_code(dv: u64) -> (Vec<u8>, u64) {
 #[cfg(target_arch = "x86_64")]
 fn t5_code(dv: u64) -> (Vec<u8>, u64) {
     let mut c = vec![];
+    x_sub_rsp_8(&mut c); // align stack for calls (SysV ABI)
     let marker = dv + 16;
     x_mov_rdi_imm32(&mut c, T5_SIG as u32);
     let s = site(&c);
@@ -689,6 +694,7 @@ fn t6_code(dv: u64) -> Vec<u8> {
 #[cfg(target_arch = "x86_64")]
 fn t6_code(dv: u64) -> Vec<u8> {
     let mut c = vec![];
+    x_sub_rsp_8(&mut c); // align stack for calls (SysV ABI)
     // POSIX order: (pid, path, actions, attrp, argv, envp).
     let s = site(&c);
     x_lea_rip(&mut c, 7, s, dv + 32);
@@ -789,6 +795,7 @@ fn t7_code(dv: u64) -> Vec<u8> {
 #[cfg(target_arch = "x86_64")]
 fn t7_code(dv: u64) -> Vec<u8> {
     let mut c = vec![];
+    x_sub_rsp_8(&mut c); // align stack for calls (SysV ABI)
     let s = site(&c);
     x_movsd_xmm0_rip(&mut c, s, dv);
     let s = site(&c);
@@ -839,6 +846,7 @@ fn fault_code() -> Vec<u8> {
 #[cfg(target_arch = "x86_64")]
 fn fault_code() -> Vec<u8> {
     let mut c = vec![];
+    x_sub_rsp_8(&mut c); // align stack for calls (SysV ABI)
     x_mov_r32_imm(&mut c, 0, 0);
     x_load_eax_rax(&mut c); // mov eax, [rax] with rax == 0
     c

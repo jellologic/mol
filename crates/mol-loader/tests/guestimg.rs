@@ -351,6 +351,18 @@ pub fn x_xor_r9d(out: &mut Vec<u8>) {
     out.extend_from_slice(&[0x45, 0x31, 0xc9]);
 }
 
+/// `sub rsp, 8`: mandatory guest prologue (first emission).
+/// Entry arrives with `rsp % 16 == 8` (SysV ABI, matches macOS);
+/// every `call` needs `rsp % 16 == 0` or the callee observes a
+/// misaligned stack and alignment-sensitive spills (`movaps`) #GP
+/// on real hardware (Rosetta emulates through it, which hid the
+/// T6 CI-only SIGSEGV). Guests are straight-line with no other
+/// stack use, so one prologue covers all calls.
+#[cfg(target_arch = "x86_64")]
+pub fn x_sub_rsp_8(out: &mut Vec<u8>) {
+    out.extend_from_slice(&[0x48, 0x83, 0xec, 0x08]);
+}
+
 /// lea r64, [rip+disp]: rax=0 rcx=1 rdx=2 rbx=3 rsi=6 rdi=7 r8=8 ...
 /// r15=15 (REX.R for the high half).
 #[cfg(target_arch = "x86_64")]
@@ -687,6 +699,14 @@ pub fn build_import_guest(
     data: &[u8],
 ) -> Vec<u8> {
     assert!(code.len() <= 0x3000, "code too large");
+    // x86_64 guests must open with the `sub rsp, 8` prologue
+    // (`x_sub_rsp_8`): without it every shim call runs misaligned
+    // and #GPs on real hardware while passing under emulation.
+    #[cfg(target_arch = "x86_64")]
+    assert!(
+        code.len() >= 4 && code[..4] == [0x48, 0x83, 0xec, 0x08],
+        "x86_64 guest must start with x_sub_rsp_8 prologue"
+    );
     let (chained, got) = chained_payload(imports);
     assert!(32 + 512 + chained.len() < CHAIN_OFF as usize + 0x1000);
     let data_len = got.len() + data.len();
@@ -906,6 +926,9 @@ mod tests {
         x_xor_r9d(&mut v);
         assert_eq!(v, vec![0x45, 0x31, 0xc9]);
         v.clear();
+        x_sub_rsp_8(&mut v);
+        assert_eq!(v, vec![0x48, 0x83, 0xec, 0x08]);
+        v.clear();
         x_lea_rip(&mut v, 7, 0x28, 0xa8);
         assert_eq!(v[..3], vec![0x48, 0x8d, 0x3d]);
         assert_eq!(v.len(), 7);
@@ -1030,7 +1053,13 @@ mod tests {
 
     #[test]
     fn builder_layout_sane() {
-        let img = build_import_guest(0x0100_0007, 3, &["_write"], &[0xc3], b"hi");
+        // x86_64 hosts enforce the guest prologue (see
+        // build_import_guest); other hosts take a bare ret.
+        #[cfg(target_arch = "x86_64")]
+        let code: &[u8] = &[0x48, 0x83, 0xec, 0x08, 0xc3];
+        #[cfg(not(target_arch = "x86_64"))]
+        let code: &[u8] = &[0xc3];
+        let img = build_import_guest(0x0100_0007, 3, &["_write"], code, b"hi");
         // Header + 5 commands + chained + code + got + data.
         assert_eq!(&img[..4], &[0xcf, 0xfa, 0xed, 0xfe]);
         assert_eq!(u32::from_le_bytes(img[16..20].try_into().unwrap()), 5);
@@ -1038,6 +1067,9 @@ mod tests {
         let got = u64::from_le_bytes(img[0x4000..0x4008].try_into().unwrap());
         assert_eq!(got, 1u64 << 63);
         assert_eq!(&img[0x4008..0x400a], b"hi");
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(&img[0x1000..0x1005], code);
+        #[cfg(not(target_arch = "x86_64"))]
         assert_eq!(img[0x1000], 0xc3);
     }
 }
