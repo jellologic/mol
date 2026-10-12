@@ -85,7 +85,7 @@ impl<'a> Cursor<'a> {
             return Err(ParseError {
                 offset: off,
                 kind: ErrorKind::Truncated {
-                    need: off + 1,
+                    need: off.saturating_add(1),
                     len: self.b.len(),
                 },
             });
@@ -177,6 +177,16 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cstr_max_offset_reports_truncated() {
+        // `need: off + 1` wrapped at usize::MAX.
+        let c = Cursor::new(b"");
+        assert!(matches!(
+            c.cstr(usize::MAX, 0).unwrap_err().kind,
+            ErrorKind::Truncated { .. }
+        ));
+    }
 
     #[test]
     fn window_rejects_oob() {

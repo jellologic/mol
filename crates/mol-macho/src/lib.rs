@@ -155,17 +155,27 @@ impl<'a> MachFile<'a> {
                         cpusubtype,
                     },
                 })?;
-                let (off, size) = (arch.offset as usize, arch.size as usize);
-                let bytes = f.bytes.get(off..off + size).ok_or(ParseError {
-                    offset: off,
-                    kind: ErrorKind::Truncated {
-                        need: off + size,
-                        len: f.bytes.len(),
-                    },
-                })?;
+                // u64 fat fields: validate the range with checked
+                // math before narrowing (raw `off + size` overflows
+                // on hostile slices).
+                let (off, size) = (arch.offset, arch.size);
+                let fblen = f.bytes.len() as u64;
+                let end = off.checked_add(size).unwrap_or(u64::MAX);
+                let bytes = if off <= fblen && end <= fblen {
+                    // off <= end <= fblen: exact, no truncation.
+                    &f.bytes[off as usize..end as usize]
+                } else {
+                    return Err(ParseError {
+                        offset: off.min(fblen) as usize,
+                        kind: ErrorKind::Truncated {
+                            need: end.min(usize::MAX as u64) as usize,
+                            len: f.bytes.len(),
+                        },
+                    });
+                };
                 Ok(Image {
                     header: header::parse_header(bytes)?,
-                    base: off,
+                    base: off as usize,
                     bytes,
                 })
             }
@@ -212,5 +222,31 @@ mod tests {
         assert_eq!(img.base, 0);
         assert!(f.select(header::CPU_TYPE_X86_64, 0).is_err());
         assert!(img.decoded().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fat_select_rejects_wrapping_slice() {
+        // Fat64 fields are full u64: raw `off + size` overflowed.
+        // (`parse_fat` pre-validates; this pins `select` itself.)
+        let raw = [0u8; 64];
+        let file = MachFile::Fat(FatImage {
+            fat: header::Fat {
+                arches: vec![header::FatArch {
+                    cputype: header::CPU_TYPE_ARM64,
+                    cpusubtype: 0,
+                    offset: u64::MAX - 10,
+                    size: 100,
+                    align_pow: 0,
+                }],
+                is_64: true,
+            },
+            bytes: &raw,
+        });
+        assert!(matches!(
+            file.select(header::CPU_TYPE_ARM64, 0)
+                .unwrap_err()
+                .kind,
+            ErrorKind::Truncated { .. }
+        ));
     }
 }

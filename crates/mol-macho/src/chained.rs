@@ -55,7 +55,9 @@ impl SegRange {
             offset: at,
             kind: ErrorKind::OffsetOverflow,
         })?;
-        if pos + 8 > self.fileoff + self.filesize {
+        // `rel + 8 <= filesize`, overflow-free: both raw sums
+        // (`pos + 8`, `fileoff + filesize`) wrap on hostile u64s.
+        if rel >= self.filesize || 8 > self.filesize - rel {
             return Err(ParseError {
                 offset: at,
                 kind: ErrorKind::FixupOutsideSegment { vmaddr },
@@ -434,14 +436,14 @@ impl<'a> ChainedFixups<'a> {
         // cap also breaks hostile cycles.
         let max_links = page_size as u64 / stride + 1;
         let page_base = rel & !(page_size as u64 - 1);
-        let page_end = page_base + page_size as u64;
+        let page_end = page_base.saturating_add(page_size as u64);
         let mut done = 0usize;
         for _ in 0..max_links {
             if rel >= page_end {
                 return Err(ParseError {
                     offset: 0,
                     kind: ErrorKind::ChainLeftPage {
-                        vmaddr: seg.vmaddr + rel,
+                        vmaddr: seg.vmaddr.saturating_add(rel),
                     },
                 });
             }
@@ -450,11 +452,13 @@ impl<'a> ChainedFixups<'a> {
                 kind: ErrorKind::OffsetOverflow,
             })?;
             let pos = seg.file_pos(vmaddr, 0)? as usize;
-            if pos + 8 > file.len() {
+            // `pos + 8 <= len`, overflow-free (`pos` is a hostile
+            // u64 narrowed to usize).
+            if pos >= file.len() || 8 > file.len() - pos {
                 return Err(ParseError {
                     offset: 0,
                     kind: ErrorKind::Truncated {
-                        need: pos + 8,
+                        need: pos.saturating_add(8),
                         len: file.len(),
                     },
                 });
@@ -487,7 +491,7 @@ impl<'a> ChainedFixups<'a> {
         Err(ParseError {
             offset: 0,
             kind: ErrorKind::ChainTooLong {
-                vmaddr: seg.vmaddr + rel,
+                vmaddr: seg.vmaddr.saturating_add(rel),
             },
         })
     }
@@ -826,6 +830,54 @@ mod tests {
         assert!(matches!(
             res.unwrap_err().kind,
             ErrorKind::ChainLeftPage { .. }
+        ));
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn file_pos_survives_wrapping_geometry() {
+        // Same class as the map.rs fuzzer panic: `pos + 8` and
+        // `fileoff + filesize` both wrapped on hostile u64s.
+        let seg = SegRange {
+            vmaddr: 0x10000,
+            vmsize: 0x2000,
+            fileoff: u64::MAX - 10,
+            filesize: 100,
+        };
+        // rel = 5, rel + 8 = 13 <= 100: exact hit, no panic.
+        assert_eq!(seg.file_pos(0x10005, 0).unwrap(), u64::MAX - 5);
+        // rel past filesize: clean error.
+        assert!(seg.file_pos(0x10000 + 200, 0).is_err());
+    }
+
+    #[test]
+    fn chain_left_page_saturates_hostile_vmaddr() {
+        // The ChainLeftPage diagnostic added `seg.vmaddr + rel`
+        // raw: with vmaddr near u64::MAX the error path panicked.
+        // (The walk itself passes its checked_add; only the
+        // diagnostic wrapped.)
+        let mut p = payload();
+        p[36 + 22] = 0x00;
+        p[36 + 23] = 0x01;
+        let mut img = vec![0u8; 0x1000];
+        for b in img.iter_mut().skip(0x100) {
+            *b = 0xFF;
+        }
+        let cf = ChainedFixups::parse(&p).unwrap();
+        let segs = [SegRange {
+            vmaddr: u64::MAX - 0x200,
+            vmsize: 0x1000,
+            fileoff: 0,
+            filesize: 0x1000,
+        }];
+        let mut n = 0;
+        let res = cf.each_fixup(&img, &segs, 1 << 20, &mut |_| {
+            n += 1;
+            Ok(())
+        });
+        assert!(matches!(
+            res.unwrap_err().kind,
+            ErrorKind::ChainLeftPage { vmaddr: u64::MAX }
         ));
         assert_eq!(n, 1);
     }

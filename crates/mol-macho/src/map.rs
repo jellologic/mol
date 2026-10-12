@@ -375,7 +375,9 @@ pub fn build(
 
 fn file_offset_to_vmaddr(segments: &[MapSegment], off: u64) -> Option<u64> {
     for s in segments {
-        if off >= s.fileoff && off < s.fileoff + s.filesize {
+        // Subtraction form: `fileoff + filesize` overflows on
+        // hostile headers (fuzzer-found panic).
+        if off >= s.fileoff && off - s.fileoff < s.filesize {
             return s.vmaddr.checked_add(off - s.fileoff);
         }
     }
@@ -778,5 +780,29 @@ mod tests {
             build(&header(), &bad, &[0u8; 0x1000], 0).unwrap_err().kind,
             ErrorKind::EntryOutsideSegments { .. }
         ));
+    }
+
+    #[test]
+    fn file_offset_to_vmaddr_survives_wrapping_geometry() {
+        // Fuzzer-found panic: `fileoff + filesize` overflowed u64.
+        let seg = MapSegment {
+            segname: "__TEXT".to_string(),
+            vmaddr: 0x1000,
+            vmsize: 0x2000,
+            fileoff: u64::MAX - 100,
+            filesize: 1000,
+            maxprot: 5,
+            initprot: 5,
+            flags: 0,
+            sections: Vec::new(),
+        };
+        let segs = [seg];
+        // Inside the segment: exact translation, no panic.
+        assert_eq!(
+            file_offset_to_vmaddr(&segs, u64::MAX - 50),
+            Some(0x1000 + 50)
+        );
+        // Below the segment: no match.
+        assert_eq!(file_offset_to_vmaddr(&segs, 10), None);
     }
 }
