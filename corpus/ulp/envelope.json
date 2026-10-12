@@ -1,0 +1,8 @@
+{
+  "cos": 2,
+  "exp": 1,
+  "log": 1,
+  "pow": 2,
+  "sin": 2
+  "_meta": {"trace": "corpus/ulp/apple-arm64.csv", "rows": 11690, "arch": "aarch64", "margin": 1, "exact": ["sqrt", "floor", "ceil", "fmod", "fabs"]}
+}

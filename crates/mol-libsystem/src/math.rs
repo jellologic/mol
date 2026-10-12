@@ -2,16 +2,16 @@
 //! libm wrappers through the host `libm` (doc 11 F3, P1.2.3).
 //!
 //! Guests call the real `libm` entry points (`_sin`, `_pow`, …);
-//! mol forwards to the host math library and propagates domain
-//! errors (`EDOM`/`ERANGE`, same numbers both OSes) into the guest
-//! errno cell. Fidelity is the measured ulp envelope (V2), not
-//! correct rounding: Apple `cosf` itself is not correctly rounded.
+//! mol forwards to the host math library. The guest errno cell is
+//! left strictly untouched: Apple's `math_errhandling` is
+//! `MATH_ERREXCEPT` only (verified by the V2 oracle probe —
+//! `sqrt(-1)`, `log(-1)`, overflowing `exp` all leave errno 0), so
+//! propagating glibc's `EDOM`/`ERANGE` would diverge. Fidelity is
+//! the measured ulp envelope (V2), not correct rounding: Apple
+//! `cosf` itself is not correctly rounded.
 //!
 //! Linux-only: guests execute on Linux. One system-library edge
-//! (`-lm` + `__errno_location` from `-lc`) under doc 27; no Rust
-//! dependencies.
-
-use core::ffi::c_int;
+//! (`-lm`) under doc 27; no Rust dependencies.
 
 #[link(name = "m")]
 unsafe extern "C" {
@@ -27,30 +27,13 @@ unsafe extern "C" {
     fn fabs(x: f64) -> f64;
 }
 
-// glibc and musl both provide `__errno_location` (the Ubuntu
-// Desktop target is glibc).
-#[link(name = "c")]
-unsafe extern "C" {
-    fn __errno_location() -> *mut c_int;
-}
-
-/// Call a host libm function with the zero-check-propagate errno
-/// protocol: clear the HOST cell first (Rust std may have left it
-/// stale), call, propagate a fresh nonzero errno to the GUEST cell.
+/// Forward to the host function, leaving errno (host and guest)
+/// exactly as found.
 macro_rules! wrap1 {
     ($mol:ident, $host:ident) => {
         pub extern "C" fn $mol(x: f64) -> f64 {
-            // SAFETY: pure arithmetic on a finite-or-not double; the
-            // errno cell pointer is valid for this thread.
-            unsafe {
-                *__errno_location() = 0;
-                let r = $host(x);
-                let e = *__errno_location();
-                if e != 0 {
-                    mol_syscall::errcell::set(mol_syscall::errno::from_linux(e));
-                }
-                r
-            }
+            // SAFETY: pure arithmetic on a finite-or-not double.
+            unsafe { $host(x) }
         }
     };
 }
@@ -59,15 +42,7 @@ macro_rules! wrap2 {
     ($mol:ident, $host:ident) => {
         pub extern "C" fn $mol(x: f64, y: f64) -> f64 {
             // SAFETY: as above.
-            unsafe {
-                *__errno_location() = 0;
-                let r = $host(x, y);
-                let e = *__errno_location();
-                if e != 0 {
-                    mol_syscall::errcell::set(mol_syscall::errno::from_linux(e));
-                }
-                r
-            }
+            unsafe { $host(x, y) }
         }
     };
 }
@@ -76,7 +51,18 @@ wrap1!(mol_sin, sin);
 wrap1!(mol_cos, cos);
 wrap1!(mol_exp, exp);
 wrap1!(mol_log, log);
-wrap2!(mol_pow, pow);
+/// `pow` with the C99-mandated short-circuits first: `pow(1, y)`
+/// and `pow(x, ±0)` are exactly 1 for any other operand, even NaN.
+/// The host libm gets the order wrong for signaling NaNs (glibc
+/// `pow(1.0, sNaN)` is NaN; Apple returns 1.0 — oracle trace).
+/// Note `pow(-1, non-integer)` is NaN (domain error), not 1.
+pub extern "C" fn mol_pow(x: f64, y: f64) -> f64 {
+    if x == 1.0 || y == 0.0 {
+        return 1.0;
+    }
+    // SAFETY: pure arithmetic on finite-or-not doubles.
+    unsafe { pow(x, y) }
+}
 wrap1!(mol_sqrt, sqrt);
 wrap1!(mol_floor, floor);
 wrap1!(mol_ceil, ceil);
@@ -120,12 +106,24 @@ mod tests {
     }
 
     #[test]
-    fn domain_error_sets_guest_errno() {
-        mol_syscall::errcell::set(0);
+    fn pow_special_cases_match_c99() {
+        let qnan = f64::from_bits(0x7ff8_0000_0000_0000);
+        let snan = f64::from_bits(0x7ff4_0000_0000_0000);
+        assert_eq!(mol_pow(1.0, qnan), 1.0);
+        assert_eq!(mol_pow(1.0, snan), 1.0);
+        assert_eq!(mol_pow(-1.0, f64::INFINITY), 1.0);
+        assert!(mol_pow(-1.0, 0.5).is_nan());
+        assert_eq!(mol_pow(qnan, 0.0), 1.0);
+        assert_eq!(mol_pow(qnan, -0.0), 1.0);
+    }
+
+    #[test]
+    fn domain_error_leaves_guest_errno() {
+        // Oracle: Apple sqrt(-1) returns NaN with errno untouched.
+        mol_syscall::errcell::set(7);
         let r = mol_sqrt(-1.0);
         assert!(r.is_nan());
-        // glibc sets EDOM(33); Darwin EDOM is likewise 33.
-        assert_eq!(mol_syscall::errcell::get(), 33);
+        assert_eq!(mol_syscall::errcell::get(), 7);
         mol_syscall::errcell::set(0);
     }
 }

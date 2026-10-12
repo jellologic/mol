@@ -15,6 +15,7 @@ pub mod init;
 #[cfg(target_os = "linux")]
 pub mod math;
 pub mod shim;
+pub mod ulp;
 
 use shim::{Export, ExportKind};
 
