@@ -14,7 +14,7 @@ Criteria:
 - [x] P0.4.1 Harness skeleton: YAML test-def schema + validator,
   per-leg JUnit emission, compare job verdicting MATCH/DIVERGE/FLAKE,
   required compare check gating merge (docs 17, 20).
-- [ ] P0.4.2 macOS trace collector prototype captures its first golden
+- [x] P0.4.2 macOS trace collector prototype captures its first golden
   trace (stdout/stderr/exit/syscall trace) from a trivial binary. A
   GHA-hosted macOS runner counts as the P0 oracle; owned mini + Tart
   per doc 15 lands later (docs 15, 18).

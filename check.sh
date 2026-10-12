@@ -12,5 +12,9 @@ done
 cargo check --locked --workspace --all-targets
 cargo check --locked --workspace --target x86_64-unknown-linux-gnu
 cargo check --locked --workspace --target aarch64-unknown-linux-gnu
-cargo test --locked --workspace
+# The prefix-boot integration test needs mount powers (userns id-mapping),
+# which stock CI runners deny; it runs in the privileged lane instead
+# (tools/docker-boot-test.sh, P0.3.V1).
+echo "check.sh: skipping empty_prefix_boots_pid1 (see privileged lane)"
+cargo test --locked --workspace -- --skip empty_prefix_boots_pid1
 echo "check.sh: matrix green"

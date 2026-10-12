@@ -3,7 +3,7 @@
     "/bin/echo",
     "hello-harness"
   ],
-  "duration_ms": 2,
+  "duration_ms": 3,
   "exit": 0,
   "id": "harness/smoke/echo",
   "leg": "mac",
@@ -20,8 +20,8 @@
     "dtruss": "skipped",
     "dyld": "ok",
     "exec": "ok",
-    "lldb": "skipped",
+    "lldb": "ok",
     "log": "ok",
-    "xctrace": "skipped"
+    "xctrace": "ok"
   }
 }

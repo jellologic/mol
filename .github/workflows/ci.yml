@@ -39,6 +39,8 @@ jobs:
           toolchain: 1.98.1
       - name: Arch matrix check
         run: sh ./check.sh
+      - name: Privileged boot test
+        run: sh ./tools/docker-boot-test.sh
 
   legs:
     name: harness leg (${{ matrix.leg }})

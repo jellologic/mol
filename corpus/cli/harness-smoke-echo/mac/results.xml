@@ -1,4 +1,4 @@
 <?xml version='1.0' encoding='utf-8'?>
-<testsuite name="harness/smoke/echo" tests="1" failures="0" time="0.002">
-  <testcase classname="mac" name="harness/smoke/echo" time="0.002" />
+<testsuite name="harness/smoke/echo" tests="1" failures="0" time="0.003">
+  <testcase classname="mac" name="harness/smoke/echo" time="0.003" />
 </testsuite>

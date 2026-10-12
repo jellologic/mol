@@ -183,4 +183,4 @@ Cross-cutting enforcement, all phases:
 - TLS/SecureTransport compatibility lands in P3.2, but its fidelity
   surface is missing from the doc 11 F-table (OQ-117); P1–P2 exits
   are explicitly non-TLS.
-- Full backlog: doc 10, OQ-1 through OQ-118.
+- Full backlog: doc 10, OQ-1 through OQ-119.

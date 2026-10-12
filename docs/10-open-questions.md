@@ -304,3 +304,6 @@ during synthesis — no separate gaps retained for those two.)
 - OQ-118 Which mechanism provides F7 case-insensitive lookup semantics on
   ext4 (FUSE overlay, ciopfs-style layer, in-shim translation)?
   Needed before the P2.3 fs-fidelity suites bind.
+- OQ-119 xctrace `.trace` files evaporate with the CI runner (only the
+  path is recorded). Decide the export/summary format for `.trace`
+  goldens before P1 differential work depends on them.

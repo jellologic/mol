@@ -31,7 +31,10 @@ P0.3 proofs run on Ubuntu 24.04, natively or in docker
   and linux/amd64 — `prefix_boot` asserts PID 1, cache env, and
   overlay content. Prefix dirs must live on an overlay-capable fs
   (ext4, tmpfs — never a docker container rootfs); in docker run
-  the test with `TMPDIR` on a tmpfs mount.
+  the test with `TMPDIR` on a tmpfs mount. CI cannot run it directly
+  (userns id-mapping denied on stock runners); the `matrix` job uses
+  `tools/docker-boot-test.sh`, a privileged-container lane running
+  the same test command.
 - Deb: `cargo deb -p mol-loader`, `dpkg -i` the artifact,
   `mol-loader --help` exits 0. Offline: the zero-dependency
   workspace builds under `cargo build --offline`.
