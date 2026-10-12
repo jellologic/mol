@@ -1,0 +1,20 @@
+# mol load-map v1
+arch: arm64 subtype=0x0
+header: filetype=DYLIB flags=0x100085 slide=0x0
+segment __TEXT vmaddr=0x0 slid=0x0 vmsize=0x4000 fileoff=0x0 filesize=0x4000 maxprot=0x5 initprot=0x5 flags=0x0
+  section __text addr=0x370 slid=0x370 size=0x14 offset=0x370 flags=0x80000400
+  section __unwind_info addr=0x384 slid=0x384 size=0x58 offset=0x384 flags=0x0
+segment __DATA vmaddr=0x4000 slid=0x4000 vmsize=0x4000 fileoff=0x4000 filesize=0x4000 maxprot=0x3 initprot=0x3 flags=0x0
+  section __data addr=0x4000 slid=0x4000 size=0x4 offset=0x4000 flags=0x0
+segment __LINKEDIT vmaddr=0x8000 slid=0x8000 vmsize=0x4000 fileoff=0x8000 filesize=0x250 maxprot=0x1 initprot=0x1 flags=0x0
+entry: none
+dylinker: none
+dylib LC_ID_DYLIB librich-arm64.dylib current=0.0.0 compat=0.0.0
+dylib LC_LOAD_DYLIB /usr/lib/libSystem.B.dylib current=1359.0.0 compat=1.0.0
+uuid: 8090c92a-410a-3cae-b241-2ef000cca4a0
+build: platform=macOS minos=27.0.0 sdk=27.0.0
+codesign: ident=librich-arm64.dylib flags=0x20002 team=none
+exports: 2
+  export 0x370 flags=0x0 _bump
+  export 0x4000 flags=0x0 _shared_counter
+fixups: 0

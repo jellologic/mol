@@ -10,3 +10,8 @@ __pycache__/
 *.pyc
 .DS_Store
 /results/
+# cargo-fuzz working dirs (targets, seeds, and lockfile are committed).
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/

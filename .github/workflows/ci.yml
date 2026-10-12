@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 # P0.1 policy job + P0.2 arch-matrix job + P0.4 dual-leg harness jobs
-# (docs 38, 39, 41).
+# (docs 38, 39, 41) + P1.1 oracle-diff + fuzz jobs (doc 42).
 name: ci
 on:
   push:
@@ -83,3 +83,34 @@ jobs:
           path: cm/linux
       - name: Compare legs
         run: python3 tools/mol-harness compare cm/mac cm/linux --out cm
+
+  oracle-diff:
+    name: oracle diff (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - name: Differential parse vs platform tools
+        run: cargo test --locked -p mol-macho --test oracle
+
+  fuzz:
+    name: fuzz parser
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - name: AFL++ bounded run
+        run: sh ./tools/fuzz-afl.sh
+        env:
+          MOL_FUZZ_SECS: "120"
+      - name: libFuzzer bounded runs
+        run: sh ./tools/fuzz-libfuzzer.sh
+        env:
+          MOL_FUZZ_SECS: "30"

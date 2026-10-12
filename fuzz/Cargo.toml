@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "mol-fuzz"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Detached from the main workspace: nightly-only fuzzing frontend with
+# its own lockfile (see fuzz/Cargo.lock). Product supply chain
+# (deny/audit) covers the root workspace only.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+mol-macho = { path = "../crates/mol-macho" }
+
+[[bin]]
+name = "parse_file"
+path = "fuzz_targets/parse_file.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "trie"
+path = "fuzz_targets/trie.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "chained"
+path = "fuzz_targets/chained.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "opcodes"
+path = "fuzz_targets/opcodes.rs"
+test = false
+doc = false

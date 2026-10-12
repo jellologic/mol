@@ -29,7 +29,82 @@ enum Action {
     Version,
     Boot(BootArgs),
     InnerBoot(BootArgs),
+    Run(RunArgs),
     UsageError(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RunArgs {
+    sysroot: Option<PathBuf>,
+    slide: Option<u64>,
+    stack_size: Option<u64>,
+    image: String,
+    args: Vec<String>,
+}
+
+fn parse_num(s: &str, flag: &str) -> Result<u64, String> {
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).map_err(|_| format!("{flag}: invalid number '{s}'"))
+    } else {
+        s.parse::<u64>()
+            .map_err(|_| format!("{flag}: invalid number '{s}'"))
+    }
+}
+
+/// Parse `run` flags; the first positional is the guest image and the
+/// rest become guest argv. `--` may separate options from the image.
+fn parse_run(argv: &[String]) -> Result<RunArgs, String> {
+    let mut out = RunArgs {
+        sysroot: None,
+        slide: None,
+        stack_size: None,
+        image: String::new(),
+        args: Vec::new(),
+    };
+    let mut i = 0;
+    let mut positionals: Vec<String> = Vec::new();
+    let mut end_of_flags = false;
+    while i < argv.len() {
+        let word = argv[i].as_str();
+        // The image ends flag parsing: everything after it is guest
+        // argv, even words starting with `-`.
+        if end_of_flags || !positionals.is_empty() || !word.starts_with('-') || word == "-" {
+            positionals.push(argv[i].clone());
+        } else {
+            match word {
+                "--" => end_of_flags = true,
+                "--sysroot" => {
+                    i += 1;
+                    let val = argv
+                        .get(i)
+                        .ok_or_else(|| "run: --sysroot needs a value".to_string())?;
+                    out.sysroot = Some(PathBuf::from(val));
+                }
+                "--slide" => {
+                    i += 1;
+                    let val = argv
+                        .get(i)
+                        .ok_or_else(|| "run: --slide needs a value".to_string())?;
+                    out.slide = Some(parse_num(val, "--slide")?);
+                }
+                "--stack-size" => {
+                    i += 1;
+                    let val = argv
+                        .get(i)
+                        .ok_or_else(|| "run: --stack-size needs a value".to_string())?;
+                    out.stack_size = Some(parse_num(val, "--stack-size")?);
+                }
+                other => return Err(format!("unexpected run flag '{other}'")),
+            }
+        }
+        i += 1;
+    }
+    if positionals.is_empty() {
+        return Err("run: missing <mach-o> image".to_string());
+    }
+    out.image = positionals.remove(0);
+    out.args = positionals;
+    Ok(out)
 }
 
 fn empty_boot_args() -> BootArgs {
@@ -43,11 +118,7 @@ fn empty_boot_args() -> BootArgs {
     }
 }
 
-fn take_value(
-    argv: &[String],
-    i: &mut usize,
-    slot: &mut Option<PathBuf>,
-) -> Result<(), String> {
+fn take_value(argv: &[String], i: &mut usize, slot: &mut Option<PathBuf>) -> Result<(), String> {
     *i += 1;
     let val = argv
         .get(*i)
@@ -90,6 +161,10 @@ fn dispatch(argv: &[String]) -> Action {
             Ok(a) => Action::Boot(a),
             Err(e) => Action::UsageError(e),
         },
+        Some("run") => match parse_run(&argv[1..]) {
+            Ok(a) => Action::Run(a),
+            Err(e) => Action::UsageError(e),
+        },
         Some("__inner-boot") => match parse_boot(&argv[1..]) {
             Ok(a) => Action::InnerBoot(a),
             Err(e) => Action::UsageError(e),
@@ -111,7 +186,10 @@ fn help_text() -> &'static str {
      \x20 boot --root <prefix> [--lowerdir L --upperdir U --workdir W\n\
      \x20      --cache-dir C] -- <init> [args...]\n\
      \x20     boot an empty prefix: new mount+PID namespaces, overlay\n\
-     \x20     merged view at <prefix>/merged, init exec'd as PID 1 (upper/work need overlay-capable fs)\n"
+     \x20     merged view at <prefix>/merged, init exec'd as PID 1 (upper/work need overlay-capable fs)\n\
+     \x20 run [--sysroot S] [--slide N] [--stack-size N] <mach-o> [args...]\n\
+     \x20     run a same-ISA Mach-O guest in-process (Linux-only);\n\
+     \x20     --slide pins ASLR (hex or decimal, default random)\n"
 }
 
 fn resolve_spec(args: &BootArgs) -> Result<PrefixSpec, String> {
@@ -217,6 +295,41 @@ fn run_inner_boot(_spec: &PrefixSpec, _init: &[String]) -> i32 {
     1
 }
 
+#[cfg(target_os = "linux")]
+fn run_guest_cmd(args: &RunArgs) -> i32 {
+    let mut argv = vec![args.image.clone()];
+    argv.extend(args.args.iter().cloned());
+    let envp: Vec<String> = env::vars().map(|(k, v)| format!("{k}={v}")).collect();
+    let mut opts = mol_loader::run::RunOptions {
+        argv,
+        envp,
+        sysroot: args
+            .sysroot
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        fixed_slide: args.slide,
+        ..mol_loader::run::RunOptions::default()
+    };
+    if let Some(stack) = args.stack_size {
+        opts.stack_size = stack;
+    }
+    // Diverges into the guest on success; returns only on error.
+    match mol_loader::run::run_guest(&args.image, &opts) {
+        Ok(()) => unreachable!("run_guest diverges on success"),
+        Err(e) => {
+            eprintln!("mol-loader: {e}");
+            1
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_guest_cmd(_args: &RunArgs) -> i32 {
+    eprintln!("mol-loader: guest execution is Linux-only");
+    1
+}
+
 fn main() -> ExitCode {
     let argv: Vec<String> = env::args().skip(1).collect();
     match dispatch(&argv) {
@@ -246,6 +359,7 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        Action::Run(args) => ExitCode::from(run_guest_cmd(&args) as u8),
         Action::UsageError(e) => {
             eprintln!("mol-loader: {e}");
             eprintln!("mol-loader: loading is not yet implemented (see P1.4)");
@@ -278,7 +392,15 @@ mod tests {
     #[test]
     fn boot_parses_flags_and_init() {
         let action = dispatch(&args(&[
-            "boot", "--root", "/p", "--cache-dir", "/c", "--", "/bin/sh", "-c", "echo hi",
+            "boot",
+            "--root",
+            "/p",
+            "--cache-dir",
+            "/c",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo hi",
         ]));
         match action {
             Action::Boot(a) => {
@@ -318,6 +440,48 @@ mod tests {
     fn unexpected_top_arg_is_usage_error() {
         assert!(matches!(
             dispatch(&args(&["--bogus"])),
+            Action::UsageError(_)
+        ));
+    }
+
+    #[test]
+    fn run_parses_flags_image_and_guest_args() {
+        let action = dispatch(&args(&[
+            "run",
+            "--sysroot",
+            "/p/merged",
+            "--slide",
+            "0x10000",
+            "--stack-size",
+            "16777216",
+            "guest",
+            "-a",
+            "b",
+        ]));
+        match action {
+            Action::Run(a) => {
+                assert_eq!(a.sysroot, Some(PathBuf::from("/p/merged")));
+                assert_eq!(a.slide, Some(0x10000));
+                assert_eq!(a.stack_size, Some(16777216));
+                assert_eq!(a.image, "guest");
+                assert_eq!(a.args, vec!["-a", "b"]);
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_requires_image_and_valid_numbers() {
+        assert!(matches!(
+            dispatch(&args(&["run", "--slide", "0x10"])),
+            Action::UsageError(_)
+        ));
+        assert!(matches!(
+            dispatch(&args(&["run", "--slide", "zz", "guest"])),
+            Action::UsageError(_)
+        ));
+        assert!(matches!(
+            dispatch(&args(&["run", "--bogus", "guest"])),
             Action::UsageError(_)
         ));
     }

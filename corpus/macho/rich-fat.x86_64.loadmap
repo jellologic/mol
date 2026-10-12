@@ -1,0 +1,24 @@
+# mol load-map v1
+arch: x86_64 subtype=0x3
+header: filetype=EXECUTE flags=0x200085 slide=0x0
+segment __PAGEZERO vmaddr=0x0 slid=0x0 vmsize=0x100000000 fileoff=0x0 filesize=0x0 maxprot=0x0 initprot=0x0 flags=0x0
+segment __TEXT vmaddr=0x100000000 slid=0x100000000 vmsize=0x1000 fileoff=0x0 filesize=0x1000 maxprot=0x5 initprot=0x5 flags=0x0
+  section __text addr=0x100000460 slid=0x100000460 size=0x23 offset=0x460 flags=0x80000400
+  section __stubs addr=0x100000484 slid=0x100000484 size=0x6 offset=0x484 flags=0x80000408
+  section __unwind_info addr=0x10000048c slid=0x10000048c size=0x58 offset=0x48c flags=0x0
+segment __DATA_CONST vmaddr=0x100001000 slid=0x100001000 vmsize=0x1000 fileoff=0x1000 filesize=0x1000 maxprot=0x3 initprot=0x3 flags=0x10
+  section __got addr=0x100001000 slid=0x100001000 size=0x10 offset=0x1000 flags=0x6
+segment __LINKEDIT vmaddr=0x100002000 slid=0x100002000 vmsize=0x1000 fileoff=0x2000 filesize=0x130 maxprot=0x1 initprot=0x1 flags=0x0
+entry: 0x100000460 slid=0x100000460 stacksize=0x0 via=LC_MAIN
+dylinker: /usr/lib/dyld
+dylib LC_LOAD_DYLIB librich-x86_64.dylib current=0.0.0 compat=0.0.0
+dylib LC_LOAD_DYLIB /usr/lib/libSystem.B.dylib current=1359.0.0 compat=1.0.0
+uuid: f9a57c8f-3dcc-3b4a-8c0e-ca2dc1bf4344
+build: platform=macOS minos=27.0.0 sdk=27.0.0
+codesign: none
+exports: 2
+  export 0x0 flags=0x0 __mh_execute_header
+  export 0x460 flags=0x0 _main
+fixups: 2
+  fixup 0x100001000 slid=0x100001000 seg=2 off=0x0 chain bind ord=0 lib=1 _bump+0
+  fixup 0x100001008 slid=0x100001008 seg=2 off=0x8 chain bind ord=1 lib=1 _shared_counter+0

@@ -6,3 +6,8 @@
 //! thin+fat corpus (P1.1.V1). No framework code lives here.
 
 pub mod prefix;
+#[cfg(target_os = "linux")]
+pub mod run;
+pub mod stack;
+#[cfg(target_os = "linux")]
+pub(crate) mod sys_linux;

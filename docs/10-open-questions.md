@@ -307,3 +307,10 @@ during synthesis — no separate gaps retained for those two.)
 - OQ-119 xctrace `.trace` files evaporate with the CI runner (only the
   path is recorded). Decide the export/summary format for `.trace`
   goldens before P1 differential work depends on them.
+- OQ-120 System binaries ship an `arm64e.x1` slice (cpusubtype 12)
+  alongside `arm64e` (subtype 2). Current selection prefers exact
+  subtype matches, so plain-arm64 requests resolve to the first
+  arm64-family slice in file order (arm64e today). Confirm with
+  launch trials on PAC hardware whether `.x1` slices need distinct
+  handling (newer codegen? key domain?) before Tier-1 runs against
+  system binaries in P1.4.

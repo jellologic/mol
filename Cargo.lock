@@ -9,6 +9,9 @@ version = "0.1.0"
 [[package]]
 name = "mol-dyld"
 version = "0.1.0"
+dependencies = [
+ "mol-macho",
+]
 
 [[package]]
 name = "mol-launchd"
@@ -21,6 +24,10 @@ version = "0.1.0"
 [[package]]
 name = "mol-loader"
 version = "0.1.0"
+dependencies = [
+ "mol-dyld",
+ "mol-macho",
+]
 
 [[package]]
 name = "mol-mach"

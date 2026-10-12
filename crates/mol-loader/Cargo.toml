@@ -7,6 +7,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[dependencies]
+mol-macho = { version = "0.1.0", path = "../mol-macho" }
+mol-dyld = { version = "0.1.0", path = "../mol-dyld" }
+
 [package.metadata.deb]
 name = "mol-loader"
 maintainer = "jellologic <31935831+jellologic@users.noreply.github.com>"
