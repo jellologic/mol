@@ -53,8 +53,11 @@ done
 
 echo "fuzz-afl: running ${DUR}s, out=$OUT"
 export AFL_SKIP_CPUFREQ=1 AFL_NO_UI=1
+# afl-fuzz refuses to run unless core dumps go to a plain file.
 if [ -w /proc/sys/kernel/core_pattern ]; then
   echo core > /proc/sys/kernel/core_pattern
+elif [ -n "$SUDO" ]; then
+  echo core | $SUDO tee /proc/sys/kernel/core_pattern >/dev/null
 else
   echo "fuzz-afl: core_pattern not writable; crashes may be missed" >&2
 fi

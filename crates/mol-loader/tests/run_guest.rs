@@ -5,8 +5,10 @@
 
 use std::process::{Command, Output};
 
-const TEXT_VMADDR: u64 = 0x1000;
-const DATA_VMADDR: u64 = 0x4000;
+// Realistic macOS-style addresses: mapping below vm.mmap_min_addr
+// (64K) fails with EPERM for non-root users (CI runners).
+const TEXT_VMADDR: u64 = 0x1000_0000;
+const DATA_VMADDR: u64 = 0x1000_4000;
 const MARK_OFF: u64 = 0x30;
 
 fn host_cpu() -> (u32, u32) {
@@ -66,14 +68,38 @@ fn code_argc() -> Vec<u8> {
     v
 }
 
+/// Materialize a 64-bit absolute address in `reg` (movz + movk
+/// chain, minimal parts).
+#[cfg(target_arch = "aarch64")]
+fn mov_abs(reg: u32, val: u64, out: &mut Vec<u8>) {
+    let parts = [
+        (val & 0xffff) as u16,
+        ((val >> 16) & 0xffff) as u16,
+        ((val >> 32) & 0xffff) as u16,
+        ((val >> 48) & 0xffff) as u16,
+    ];
+    let first = parts.iter().position(|&p| p != 0).unwrap_or(0);
+    w32(
+        0xd280_0000 | ((first as u32) << 21) | ((parts[first] as u32) << 5) | reg,
+        out,
+    );
+    for (hw, &p) in parts.iter().enumerate() {
+        if hw != first && p != 0 {
+            w32(
+                0xf280_0000 | ((hw as u32) << 21) | ((p as u32) << 5) | reg,
+                out,
+            );
+        }
+    }
+}
+
 /// Store 7 to the marker. `at` is this routine's own vmaddr (x86_64
 /// RIP-relative addressing); `marker` is the slid marker address.
 fn code_store(at: u64, marker: u64) -> Vec<u8> {
     let mut v = Vec::new();
     #[cfg(target_arch = "aarch64")]
     {
-        assert!(marker < 0x1_0000);
-        w32(0xd280_0000 | ((marker as u32) << 5), &mut v); // movz x0, #marker
+        mov_abs(0, marker, &mut v);
         w32(0x5280_00e1, &mut v); // mov w1, #7
         w32(0xb900_0001, &mut v); // str w1, [x0]
         w32(0xd65f_03c0, &mut v); // ret
@@ -95,8 +121,7 @@ fn code_load(at: u64, marker: u64) -> Vec<u8> {
     let mut v = Vec::new();
     #[cfg(target_arch = "aarch64")]
     {
-        assert!(marker < 0x1_0000);
-        w32(0xd280_0000 | ((marker as u32) << 5), &mut v); // movz x0, #marker
+        mov_abs(0, marker, &mut v);
         w32(0xb940_0000, &mut v); // ldr w0, [x0]
         w32(0xd65f_03c0, &mut v); // ret
         let _ = at;
