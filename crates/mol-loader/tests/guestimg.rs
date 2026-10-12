@@ -424,6 +424,12 @@ pub fn x_mov_edi_eax(out: &mut Vec<u8>) {
     out.extend_from_slice(&[0x89, 0xc7]);
 }
 
+/// mov ebx, edi.
+#[cfg(target_arch = "x86_64")]
+pub fn x_mov_ebx_edi(out: &mut Vec<u8>) {
+    out.extend_from_slice(&[0x89, 0xfb]);
+}
+
 /// mov r64, r64 (low regs: ax=0 cx=1 dx=2 bx=3 sp=4 bp=5 si=6 di=7).
 #[cfg(target_arch = "x86_64")]
 pub fn x_mov_r64_r64(out: &mut Vec<u8>, dst: u8, src: u8) {
@@ -939,6 +945,9 @@ mod tests {
         v.clear();
         x_mov_edi_eax(&mut v);
         assert_eq!(v, vec![0x89, 0xc7]);
+        v.clear();
+        x_mov_ebx_edi(&mut v);
+        assert_eq!(v, vec![0x89, 0xfb]);
         v.clear();
         x_mov_r64_r64(&mut v, 3, 0);
         assert_eq!(v, vec![0x48, 0x89, 0xc3]);

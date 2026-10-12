@@ -49,6 +49,16 @@ fn run(path: &std::path::Path) -> Output {
         .expect("spawn mol-loader")
 }
 
+/// Human exit/signal summary for failure messages (a bare `None`
+/// code hides which signal killed the guest).
+fn status_str(out: &Output) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    match out.status.code() {
+        Some(c) => format!("exit {c}"),
+        None => format!("signal {:?}", out.status.signal()),
+    }
+}
+
 fn site(c: &[u8]) -> u64 {
     CODE_VA + c.len() as u64
 }
@@ -157,8 +167,9 @@ fn t1_write_stdout_exit7() {
     assert_eq!(
         out.status.code(),
         Some(7),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
+        "stderr: {} ({})",
+        String::from_utf8_lossy(&out.stderr),
+        status_str(&out)
     );
     assert_eq!(out.stdout, b"hello\n");
 }
@@ -245,8 +256,9 @@ fn t2_errno_enoent_exit_code() {
     assert_eq!(
         out.status.code(),
         Some(2),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
+        "stderr: {} ({})",
+        String::from_utf8_lossy(&out.stderr),
+        status_str(&out)
     );
 }
 
@@ -366,8 +378,9 @@ fn t3_open_read_close_echo() {
     assert_eq!(
         out.status.code(),
         Some(0),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
+        "stderr: {} ({})",
+        String::from_utf8_lossy(&out.stderr),
+        status_str(&out)
     );
     assert_eq!(out.stdout, content);
 }
@@ -468,8 +481,9 @@ fn t4_mmap_writeback_munmap() {
     assert_eq!(
         out.status.code(),
         Some(0),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
+        "stderr: {} ({})",
+        String::from_utf8_lossy(&out.stderr),
+        status_str(&out)
     );
     assert_eq!(out.stdout.len(), 16);
     assert_eq!(out.stdout[0], 0xab);
@@ -602,8 +616,9 @@ fn t5_sigaction_self_delivery() {
     assert_eq!(
         out.status.code(),
         Some(0),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
+        "stderr: {} ({})",
+        String::from_utf8_lossy(&out.stderr),
+        status_str(&out)
     );
 }
 
@@ -690,7 +705,7 @@ fn t6_code(dv: u64) -> Vec<u8> {
     j_patch(&mut c, ok);
     let s = site(&c);
     x_load_edi_rip(&mut c, s, dv + 32);
-    x_mov_ebx_eax(&mut c);
+    x_mov_ebx_edi(&mut c); // save pid (edi holds it, not eax)
     x_mov_edi_ebx(&mut c);
     let s = site(&c);
     x_lea_rip(&mut c, 6, s, dv + 36);
@@ -729,8 +744,9 @@ fn t6_spawn_true_wait_status() {
     assert_eq!(
         out.status.code(),
         Some(0),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
+        "stderr: {} ({})",
+        String::from_utf8_lossy(&out.stderr),
+        status_str(&out)
     );
 }
 
@@ -800,8 +816,9 @@ fn t7_ceil_half_is_one() {
     assert_eq!(
         out.status.code(),
         Some(0),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
+        "stderr: {} ({})",
+        String::from_utf8_lossy(&out.stderr),
+        status_str(&out)
     );
 }
 
@@ -813,7 +830,13 @@ fn t7_ceil_half_is_one() {
 fn t8_init_order_on_stderr() {
     let path = write_guest("t8", &t1_image());
     let out = run(&path);
-    assert_eq!(out.status.code(), Some(7));
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "stderr: {} ({})",
+        String::from_utf8_lossy(&out.stderr),
+        status_str(&out)
+    );
     let err = String::from_utf8_lossy(&out.stderr);
     let want = "init: __libkernel_init -> __libplatform_init -> __pthread_init -> _libc_initializer -> __malloc_init -> _dyld_initializer -> libdispatch_init -> _libxpc_initializer";
     assert!(err.contains(want), "stderr:\n{err}");
