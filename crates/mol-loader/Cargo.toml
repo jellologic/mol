@@ -12,6 +12,7 @@ mol-macho = { version = "0.1.0", path = "../mol-macho" }
 mol-dyld = { version = "0.1.0", path = "../mol-dyld" }
 mol-libsystem = { version = "0.1.0", path = "../mol-libsystem" }
 mol-syscall = { version = "0.1.0", path = "../mol-syscall" }
+mol-objc = { version = "0.1.0", path = "../mol-objc" }
 
 [package.metadata.deb]
 name = "mol-loader"

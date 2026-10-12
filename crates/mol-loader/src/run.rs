@@ -65,6 +65,7 @@ pub enum RunError {
     BadSegment {
         segname: String,
     },
+    Objc(mol_objc::ObjcError),
 }
 
 impl fmt::Display for RunError {
@@ -98,6 +99,7 @@ impl fmt::Display for RunError {
             RunError::BadSegment { segname } => {
                 write!(f, "run: segment {segname} file range exceeds mapping")
             }
+            RunError::Objc(e) => write!(f, "run: {e}"),
         }
     }
 }
@@ -531,8 +533,10 @@ fn map_image(bytes: &[u8], map: &mol_macho::map::LoadMap, slide: u64) -> Result<
         // already zero-filled.
         let src_off = seg.fileoff as usize;
         let src_len = seg.filesize as usize;
+        // Two-step range: `src_off + src_len` overflows on hostile u64s.
         let src = bytes
-            .get(src_off..src_off + src_len)
+            .get(src_off..)
+            .and_then(|s| s.get(..src_len))
             .ok_or(RunError::BadSegment {
                 segname: seg.segname.clone(),
             })?;
@@ -666,15 +670,86 @@ fn protect_image(map: &mol_macho::map::LoadMap, slide: u64, page: u64) -> Result
 // ---------------------------------------------------------------------------
 // transfer
 // ---------------------------------------------------------------------------
+//
+// Guest calls run on the guest stack with the host stack pointer
+// stashed in the guest frame, then restored before returning to
+// Rust. `run_inits` and `call_imp` return; `enter_entry` diverges.
 
-/// Switch to the guest stack, call each initializer, call the entry
-/// point as `entry(argc, argv, envp, apple)`, and exit with its return
-/// value. Diverges via `exit_group`.
+/// Call each initializer on the guest stack, then return.
 #[cfg(target_arch = "aarch64")]
-unsafe fn transfer(
+unsafe fn run_inits(stack: u64, fns: *const u64, n: usize) {
+    use core::arch::asm;
+    // SAFETY: `stack` is the live guest stack top (16-aligned),
+    // `fns`/`n` a live initializer list; callees are ABI-compliant
+    // guest code that preserves sp, so the stashed host sp reads
+    // back correctly.
+    unsafe {
+        asm!(
+            "mov x9, sp",
+            "mov sp, {stack}",
+            "sub sp, sp, #32",
+            "str x9, [sp, #0]",
+            "str {fns}, [sp, #8]",
+            "str {n}, [sp, #16]",
+            "b 3f",
+            "2:",
+            "ldr x9, [sp, #8]",
+            "ldr x10, [x9], #8",
+            "str x9, [sp, #8]",
+            "blr x10",
+            "ldr x9, [sp, #16]",
+            "sub x9, x9, #1",
+            "str x9, [sp, #16]",
+            "3:",
+            "ldr x9, [sp, #16]",
+            "cbnz x9, 2b",
+            "ldr x9, [sp, #0]",
+            "mov sp, x9",
+            // No `ret`: fall through to the compiler epilogue,
+            // which restores its frame and returns.
+            stack = in(reg) stack,
+            fns = in(reg) fns,
+            n = in(reg) n,
+            out("x9") _,
+            out("x10") _,
+            clobber_abi("C"),
+        );
+    }
+}
+
+/// Call one guest function as `imp(a0, a1)` on the guest stack.
+#[cfg(target_arch = "aarch64")]
+unsafe fn call_imp(stack: u64, imp: u64, a0: u64, a1: u64) -> u64 {
+    use core::arch::asm;
+    // SAFETY: as above; `imp` is a live guest code address.
+    let ret: u64;
+    unsafe {
+        asm!(
+            "mov x9, sp",
+            "mov sp, {stack}",
+            "sub sp, sp, #16",
+            "str x9, [sp, #0]",
+            "blr {imp}",
+            "ldr x9, [sp, #0]",
+            "mov sp, x9",
+            // Fall through to the compiler epilogue (no `ret`).
+            stack = in(reg) stack,
+            imp = in(reg) imp,
+            in("x0") a0,
+            in("x1") a1,
+            lateout("x0") ret,
+            out("x9") _,
+            clobber_abi("C"),
+        );
+    }
+    ret
+}
+
+/// Enter the entry point as `entry(argc, argv, envp, apple)`, and
+/// exit with its return value. Diverges via `exit_group`.
+#[cfg(target_arch = "aarch64")]
+unsafe fn enter_entry(
     stack: u64,
-    fns: *const u64,
-    n: usize,
     entry: u64,
     argc: u64,
     argv: u64,
@@ -685,59 +760,102 @@ unsafe fn transfer(
     // SAFETY: all addresses are live guest mappings; the block
     // diverges (noreturn) so clobbering sp is sound.
     unsafe {
+        // Args arrive in fixed registers: scratch `mov`s here
+        // would clobber inputs the compiler placed in x0-x3.
         asm!(
             "mov sp, {stack}",
-            "sub sp, sp, #64",
-            "str {fns}, [sp, #0]",
-            "str {n}, [sp, #8]",
-            "str {entry}, [sp, #16]",
-            "str {argc}, [sp, #24]",
-            "str {argv}, [sp, #32]",
-            "str {envp}, [sp, #40]",
-            "str {apple}, [sp, #48]",
-            "b 3f",
-            "2:",
-            "ldr x9, [sp, #0]",
-            "ldr x10, [x9], #8",
-            "str x9, [sp, #0]",
-            "blr x10",
-            "ldr x9, [sp, #8]",
-            "sub x9, x9, #1",
-            "str x9, [sp, #8]",
-            "3:",
-            "ldr x9, [sp, #8]",
-            "cbnz x9, 2b",
-            "ldr x0, [sp, #24]",
-            "ldr x1, [sp, #32]",
-            "ldr x2, [sp, #40]",
-            "ldr x3, [sp, #48]",
-            "ldr x9, [sp, #16]",
-            "add sp, sp, #64",
-            "blr x9",
+            "blr {entry}",
             "mov x8, #94",
             "svc #0",
             "brk #0",
             stack = in(reg) stack,
-            fns = in(reg) fns,
-            n = in(reg) n,
             entry = in(reg) entry,
-            argc = in(reg) argc,
-            argv = in(reg) argv,
-            envp = in(reg) envp,
-            apple = in(reg) apple,
+            in("x0") argc,
+            in("x1") argv,
+            in("x2") envp,
+            in("x3") apple,
             options(noreturn)
         );
     }
 }
 
-/// Switch to the guest stack, call each initializer, call the entry
-/// point as `entry(argc, argv, envp, apple)`, and exit with its return
-/// value. Diverges via `exit_group`.
+/// Call each initializer on the guest stack, then return.
 #[cfg(target_arch = "x86_64")]
-unsafe fn transfer(
+unsafe fn run_inits(stack: u64, fns: *const u64, n: usize) {
+    use core::arch::asm;
+    // SAFETY: `stack` is the live guest stack top (16-aligned),
+    // `fns`/`n` a live initializer list; callees are ABI-compliant
+    // guest code that preserves rsp, so the stashed host rsp reads
+    // back correctly. The 160-byte frame keeps 16-alignment and
+    // reserves the 128-byte red zone below the call rsp.
+    unsafe {
+        asm!(
+            "mov rax, rsp",
+            "mov rsp, {stack}",
+            "sub rsp, 160",
+            "mov [rsp + 128], rax",
+            "mov [rsp + 136], {fns}",
+            "mov [rsp + 144], {n}",
+            "jmp 3f",
+            "2:",
+            "mov r10, [rsp + 136]",
+            "mov r11, [r10]",
+            "add r10, 8",
+            "mov [rsp + 136], r10",
+            "call r11",
+            "mov r10, [rsp + 144]",
+            "dec r10",
+            "mov [rsp + 144], r10",
+            "3:",
+            "cmp qword ptr [rsp + 144], 0",
+            "jne 2b",
+            "mov rsp, [rsp + 128]",
+            // No `ret`: fall through to the compiler epilogue,
+            // which restores its frame and returns.
+            stack = in(reg) stack,
+            fns = in(reg) fns,
+            n = in(reg) n,
+            out("rax") _,
+            out("r10") _,
+            out("r11") _,
+            clobber_abi("C"),
+        );
+    }
+}
+
+/// Call one guest function as `imp(a0, a1)` on the guest stack.
+#[cfg(target_arch = "x86_64")]
+unsafe fn call_imp(stack: u64, imp: u64, a0: u64, a1: u64) -> u64 {
+    use core::arch::asm;
+    // SAFETY: as above; `imp` is a live guest code address. At the
+    // call, rsp is 16-aligned (144 is a multiple of 16), so the
+    // callee observes `rsp % 16 == 8` per SysV.
+    let ret: u64;
+    unsafe {
+        asm!(
+            "mov rax, rsp",
+            "mov rsp, {stack}",
+            "sub rsp, 144",
+            "mov [rsp + 128], rax",
+            "call {imp}",
+            "mov rsp, [rsp + 128]",
+            // Fall through to the compiler epilogue (no `ret`).
+            stack = in(reg) stack,
+            imp = in(reg) imp,
+            in("rdi") a0,
+            in("rsi") a1,
+            lateout("rax") ret,
+            clobber_abi("C"),
+        );
+    }
+    ret
+}
+
+/// Enter the entry point as `entry(argc, argv, envp, apple)`, and
+/// exit with its return value. Diverges via `exit_group`.
+#[cfg(target_arch = "x86_64")]
+unsafe fn enter_entry(
     stack: u64,
-    fns: *const u64,
-    n: usize,
     entry: u64,
     argc: u64,
     argv: u64,
@@ -745,50 +863,24 @@ unsafe fn transfer(
     apple: u64,
 ) -> ! {
     use core::arch::asm;
-    // SAFETY: as above.
+    // SAFETY: all addresses are live guest mappings; the block
+    // diverges (noreturn) so clobbering rsp is sound.
     unsafe {
+        // Args arrive in fixed registers: scratch `mov`s here
+        // would clobber inputs the compiler placed in rdi-rdx.
         asm!(
             "mov rsp, {stack}",
-            "sub rsp, 64",
-            "mov [rsp + 0], {fns}",
-            "mov [rsp + 8], {n}",
-            "mov [rsp + 16], {entry}",
-            "mov [rsp + 24], {argc}",
-            "mov [rsp + 32], {argv}",
-            "mov [rsp + 40], {envp}",
-            "mov [rsp + 48], {apple}",
-            "jmp 3f",
-            "2:",
-            "mov r10, [rsp + 0]",
-            "mov r11, [r10]",
-            "add r10, 8",
-            "mov [rsp + 0], r10",
-            "call r11",
-            "mov r10, [rsp + 8]",
-            "dec r10",
-            "mov [rsp + 8], r10",
-            "3:",
-            "cmp qword ptr [rsp + 8], 0",
-            "jne 2b",
-            "mov rdi, [rsp + 24]",
-            "mov rsi, [rsp + 32]",
-            "mov rdx, [rsp + 40]",
-            "mov rcx, [rsp + 48]",
-            "mov r10, [rsp + 16]",
-            "add rsp, 64",
-            "call r10",
+            "call {entry}",
             "mov rdi, rax",
             "mov rax, 231",
             "syscall",
             "ud2",
             stack = in(reg) stack,
-            fns = in(reg) fns,
-            n = in(reg) n,
             entry = in(reg) entry,
-            argc = in(reg) argc,
-            argv = in(reg) argv,
-            envp = in(reg) envp,
-            apple = in(reg) apple,
+            in("rdi") argc,
+            in("rsi") argv,
+            in("rdx") envp,
+            in("rcx") apple,
             options(noreturn)
         );
     }
@@ -990,12 +1082,35 @@ pub fn run_guest(path: &str, opts: &RunOptions) -> Result<()> {
                 if opts.debug_catch_faults {
                     crate::faults::install();
                 }
-                // SAFETY: transfer diverges into mapped guest code.
+                // ObjC metadata over mapped memory (P1.3.1): parse
+                // every image in load order, then schedule +loads.
+                // Plain C images parse to empty records.
+                let mut objc_images = Vec::with_capacity(set.images.len());
+                for img in &set.images {
+                    objc_images.push(
+                        mol_objc::meta::parse_mapped(&img.map, img.slide)
+                            .map_err(RunError::Objc)?,
+                    );
+                }
+                let mut loads = mol_objc::load::prepare(&objc_images);
+                // Initializers on the guest stack, then +loads, then
+                // entry. Each guest call preserves the host stack.
+                // SAFETY: stack/fns/entry are live guest mappings.
                 unsafe {
-                    transfer(
+                    run_inits(image.sp, fns.as_ptr(), fns.len());
+                }
+                let sp = image.sp;
+                mol_objc::load::drain(&mut loads, &mut |imp, cls, sel| {
+                    // SAFETY: imp is a validated guest code VA; the
+                    // mapping outlives the drain.
+                    unsafe {
+                        call_imp(sp, imp, cls, sel);
+                    }
+                });
+                // SAFETY: entry diverges into mapped guest code.
+                unsafe {
+                    enter_entry(
                         image.sp,
-                        fns.as_ptr(),
-                        fns.len(),
                         entry_addr,
                         argc_val,
                         argv_ptr,
@@ -1034,6 +1149,47 @@ fn entry_args(sp: u64, argc: usize, envc: usize) -> (u64, u64, u64, u64) {
 mod tests {
     use super::*;
     use mol_macho::codesign::{CS_ADHOC, CS_PLATFORM_BINARY, CS_REQUIRE_LV, CS_RUNTIME, CS_VALID};
+
+    fn test_stack() -> u64 {
+        let len = 64 * 1024;
+        let at = sys::mmap_any(len, sys::PROT_READ | sys::PROT_WRITE).unwrap();
+        let top = at + len;
+        assert_eq!(top % 16, 0);
+        top
+    }
+
+    extern "C" fn add_imp(a: u64, b: u64) -> u64 {
+        a.wrapping_add(b)
+    }
+
+    #[test]
+    fn run_inits_empty_returns() {
+        let empty: Vec<u64> = Vec::new();
+        unsafe {
+            run_inits(test_stack(), empty.as_ptr(), empty.len());
+        }
+    }
+
+    #[test]
+    fn run_inits_calls_in_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static HITS: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn bump() {
+            HITS.fetch_add(1, Ordering::SeqCst);
+        }
+        HITS.store(0, Ordering::SeqCst);
+        let fns = [bump as u64, bump as u64, bump as u64];
+        unsafe {
+            run_inits(test_stack(), fns.as_ptr(), fns.len());
+        }
+        assert_eq!(HITS.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn call_imp_passes_args_and_returns() {
+        let ret = unsafe { call_imp(test_stack(), add_imp as u64, 40, 2) };
+        assert_eq!(ret, 42);
+    }
 
     #[test]
     fn fixed_main_slide_pins_main_only() {

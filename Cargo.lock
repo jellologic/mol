@@ -32,6 +32,7 @@ dependencies = [
  "mol-dyld",
  "mol-libsystem",
  "mol-macho",
+ "mol-objc",
  "mol-syscall",
 ]
 

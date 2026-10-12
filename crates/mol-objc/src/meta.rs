@@ -7,7 +7,7 @@
 //! never panic. Supports small (relative-pointer) and big method
 //! lists; categories use absolute pointers.
 
-use mol_macho::map::{LoadMap, MapSection, MapSegment};
+use mol_macho::map::{LoadMap, MapSegment};
 
 use crate::{ObjcError, Result};
 
@@ -21,7 +21,6 @@ const FAST_DATA_MASK: u64 = 0x0000_7fff_ffff_fff8;
 // class_ro_t: name @24, baseMethods @32.
 const RO_NAME_OFFSET: usize = 24;
 const RO_METHODS_OFFSET: usize = 32;
-const RO_MIN_SIZE: usize = 40;
 
 // method_list_t: entsizeAndFlags u32, count u32.
 const MLIST_SMALL_FLAG: u32 = 0x8000_0000;
@@ -81,85 +80,142 @@ pub struct ObjcImage {
     pub categories: Vec<CategoryRec>,
 }
 
-/// Byte view over one mapped image: file bytes + segment table +
-/// slide for VA translation.
-struct View<'a> {
+/// Byte source for metadata reads: file bytes (tools, fixtures)
+/// or live mapped memory (the loader, post-fixup).
+pub trait Backing {
+    /// `len` bytes at a VA (`slid` for mapped, file VA for files).
+    fn window(&self, vma: u64, len: usize) -> Result<&[u8]>;
+}
+
+/// File-bytes backing. File pointers are unslid by definition, so
+/// this view takes no slide (slid images must use [`MappedBacking`],
+/// whose pointers were fixed up in memory).
+pub struct FileBacking<'a> {
     bytes: &'a [u8],
+    segments: &'a [MapSegment],
+}
+
+impl<'a> FileBacking<'a> {
+    pub fn new(bytes: &'a [u8], map: &'a LoadMap) -> Self {
+        FileBacking {
+            bytes,
+            segments: &map.segments,
+        }
+    }
+}
+
+impl Backing for FileBacking<'_> {
+    fn window(&self, vma: u64, len: usize) -> Result<&[u8]> {
+        for seg in self.segments {
+            let rel = vma.wrapping_sub(seg.vmaddr);
+            if rel < seg.vmsize {
+                let off = seg.fileoff.checked_add(rel).ok_or(ObjcError::Malformed {
+                    offset: vma,
+                    detail: "file offset overflows",
+                })?;
+                let end = (off as usize).checked_add(len).ok_or(ObjcError::Malformed {
+                    offset: vma,
+                    detail: "window overflows",
+                })?;
+                return self.bytes.get(off as usize..end).ok_or(ObjcError::Truncated {
+                    offset: off as usize,
+                    len: self.bytes.len(),
+                });
+            }
+        }
+        Err(ObjcError::Malformed {
+            offset: vma,
+            detail: "pointer outside image segments",
+        })
+    }
+}
+
+/// Live-memory backing over content segments mapped at
+/// `vmaddr + slide` in this process.
+pub struct MappedBacking<'a> {
     segments: &'a [MapSegment],
     slide: u64,
 }
 
-impl<'a> View<'a> {
-    fn new(bytes: &'a [u8], map: &'a LoadMap, slide: u64) -> Self {
-        View {
-            bytes,
+impl<'a> MappedBacking<'a> {
+    /// Caller guarantees every content segment is mapped readable
+    /// at its slid VA for the backing's lifetime.
+    pub fn new(map: &'a LoadMap, slide: u64) -> Self {
+        MappedBacking {
             segments: &map.segments,
             slide,
         }
     }
+}
 
-    /// Slid VA to file offset. Total: unknown VAs yield `None`.
-    fn vma_to_off(&self, vma: u64) -> Option<usize> {
+impl Backing for MappedBacking<'_> {
+    fn window(&self, vma: u64, len: usize) -> Result<&[u8]> {
         for seg in self.segments {
-            let base = seg.vmaddr.checked_add(self.slide)?;
+            // Content segments only: reservation holes share the
+            // table but are mapped PROT_NONE.
+            if seg.vmsize == 0 || seg.filesize == 0 {
+                continue;
+            }
+            let Some(base) = seg.vmaddr.checked_add(self.slide) else {
+                continue;
+            };
             let rel = vma.wrapping_sub(base);
-            if rel < seg.vmsize {
-                let off = seg.fileoff.checked_add(rel)?;
-                if off < self.bytes.len() as u64 {
-                    return Some(off as usize);
-                }
+            if rel < seg.vmsize && (len as u64) <= seg.vmsize - rel {
+                // SAFETY: validated inside a live readable mapping.
+                return Ok(unsafe {
+                    std::slice::from_raw_parts(vma as *const u8, len)
+                });
             }
         }
-        None
+        Err(ObjcError::Malformed {
+            offset: vma,
+            detail: "pointer outside mapped segments",
+        })
     }
+}
 
-    fn u64_at(&self, off: usize) -> Result<u64> {
-        let w = self
-            .bytes
-            .get(off..)
-            .and_then(|s| s.get(..8))
-            .ok_or(ObjcError::Truncated {
-                offset: off,
-                len: self.bytes.len(),
-            })?;
+/// Struct reader over a backing.
+struct View<B> {
+    backing: B,
+}
+
+impl<B: Backing> View<B> {
+    fn u64_va(&self, vma: u64) -> Result<u64> {
+        let w = self.backing.window(vma, 8)?;
         Ok(u64::from_le_bytes(w.try_into().unwrap()))
     }
 
-    fn u32_at(&self, off: usize) -> Result<u32> {
-        let w = self
-            .bytes
-            .get(off..)
-            .and_then(|s| s.get(..4))
-            .ok_or(ObjcError::Truncated {
-                offset: off,
-                len: self.bytes.len(),
-            })?;
+    fn u32_va(&self, vma: u64) -> Result<u32> {
+        let w = self.backing.window(vma, 4)?;
         Ok(u32::from_le_bytes(w.try_into().unwrap()))
     }
 
-    fn u64_va(&self, vma: u64) -> Result<u64> {
-        let off = self.vma_to_off(vma).ok_or(ObjcError::Malformed {
-            offset: vma,
-            detail: "pointer outside image segments",
-        })?;
-        self.u64_at(off)
-    }
-
-    /// NUL-terminated string at a slid VA.
-    fn cstr_va(&self, vma: u64) -> Result<&'a [u8]> {
-        let off = self.vma_to_off(vma).ok_or(ObjcError::Malformed {
-            offset: vma,
-            detail: "string pointer outside image segments",
-        })?;
-        let rest = self.bytes.get(off..).ok_or(ObjcError::Truncated {
-            offset: off,
-            len: self.bytes.len(),
-        })?;
-        let end = rest.iter().position(|&b| b == 0).ok_or(ObjcError::Malformed {
-            offset: vma,
-            detail: "unterminated string",
-        })?;
-        Ok(&rest[..end])
+    /// NUL-terminated string at a VA. Searches the enclosing
+    /// segment tail; unterminated data errors.
+    fn cstr_va(&self, vma: u64) -> Result<Vec<u8>> {
+        // Probe byte-by-byte through windows: total reads bounded
+        // by the segment the pointer validated into.
+        let mut out = Vec::new();
+        let mut at = vma;
+        loop {
+            let w = self.backing.window(at, 1)?;
+            let b = w[0];
+            if b == 0 {
+                return Ok(out);
+            }
+            // Names are short; cap before a hostile loop matters.
+            if out.len() >= 4096 {
+                return Err(ObjcError::Malformed {
+                    offset: vma,
+                    detail: "overlong string",
+                });
+            }
+            out.push(b);
+            at = at.checked_add(1).ok_or(ObjcError::Malformed {
+                offset: vma,
+                detail: "string address overflows",
+            })?;
+        }
     }
 }
 
@@ -175,18 +231,14 @@ fn find_section(map: &LoadMap, sectname: &str) -> Option<(u64, u64)> {
     None
 }
 
-/// Scan a method list at a slid VA for `+load`. Returns the IMP +
+/// Scan a method list at a VA for `+load`. Returns the IMP +
 /// SEL VAs, or `None` when the list carries no `+load`.
-fn find_load(view: &View<'_>, list_va: u64) -> Result<Option<LoadMethod>> {
+fn find_load<B: Backing>(view: &View<B>, list_va: u64) -> Result<Option<LoadMethod>> {
     if list_va == 0 {
         return Ok(None);
     }
-    let off = view.vma_to_off(list_va).ok_or(ObjcError::Malformed {
-        offset: list_va,
-        detail: "method list outside image segments",
-    })?;
-    let flags = view.u32_at(off)?;
-    let count = view.u32_at(off.checked_add(4).ok_or(ObjcError::Malformed {
+    let flags = view.u32_va(list_va)?;
+    let count = view.u32_va(list_va.checked_add(4).ok_or(ObjcError::Malformed {
         offset: list_va,
         detail: "method list header overflows",
     })?)?;
@@ -218,12 +270,8 @@ fn find_load(view: &View<'_>, list_va: u64) -> Result<Option<LoadMethod>> {
                 detail: "method entry overflows",
             })?;
         let (name_va, imp_va) = if small {
-            let eoff = view.vma_to_off(entry_va).ok_or(ObjcError::Malformed {
-                offset: entry_va,
-                detail: "method entry outside image segments",
-            })?;
-            let name_off = view.u32_at(eoff)? as i32 as i64;
-            let imp_off = view.u32_at(eoff.checked_add(8).ok_or(ObjcError::Malformed {
+            let name_off = view.u32_va(entry_va)? as i32 as i64;
+            let imp_off = view.u32_va(entry_va.checked_add(8).ok_or(ObjcError::Malformed {
                 offset: entry_va,
                 detail: "method entry overflows",
             })?)? as i32 as i64;
@@ -233,12 +281,8 @@ fn find_load(view: &View<'_>, list_va: u64) -> Result<Option<LoadMethod>> {
                 base.wrapping_add(imp_off) as u64,
             )
         } else {
-            let eoff = view.vma_to_off(entry_va).ok_or(ObjcError::Malformed {
-                offset: entry_va,
-                detail: "method entry outside image segments",
-            })?;
-            let name = view.u64_at(eoff)?;
-            let imp = view.u64_at(eoff.checked_add(16).ok_or(ObjcError::Malformed {
+            let name = view.u64_va(entry_va)?;
+            let imp = view.u64_va(entry_va.checked_add(16).ok_or(ObjcError::Malformed {
                 offset: entry_va,
                 detail: "method entry overflows",
             })?)?;
@@ -254,85 +298,42 @@ fn find_load(view: &View<'_>, list_va: u64) -> Result<Option<LoadMethod>> {
     Ok(None)
 }
 
+fn add_va(base: u64, off: usize) -> Result<u64> {
+    base.checked_add(off as u64).ok_or(ObjcError::Malformed {
+        offset: base,
+        detail: "struct field overflows",
+    })
+}
+
 /// Class name via `data -> class_ro -> name`.
-fn class_name(view: &View<'_>, class_va: u64) -> Result<String> {
-    let coff = view.vma_to_off(class_va).ok_or(ObjcError::Malformed {
-        offset: class_va,
-        detail: "class outside image segments",
-    })?;
-    let data = view.u64_at(coff.checked_add(CLASS_DATA_OFFSET).ok_or(
-        ObjcError::Malformed {
-            offset: class_va,
-            detail: "class header overflows",
-        },
-    )?)? & FAST_DATA_MASK;
-    let ro = view.vma_to_off(data).ok_or(ObjcError::Malformed {
-        offset: data,
-        detail: "class_ro outside image segments",
-    })?;
-    let name_va = view.u64_at(ro.checked_add(RO_NAME_OFFSET).ok_or(
-        ObjcError::Malformed {
-            offset: data,
-            detail: "class_ro header overflows",
-        },
-    )?)?;
+fn class_name<B: Backing>(view: &View<B>, class_va: u64) -> Result<String> {
+    let data = view.u64_va(add_va(class_va, CLASS_DATA_OFFSET)?)? & FAST_DATA_MASK;
+    let name_va = view.u64_va(add_va(data, RO_NAME_OFFSET)?)?;
     let bytes = view.cstr_va(name_va)?;
-    String::from_utf8(bytes.to_vec()).map_err(|_| ObjcError::Malformed {
+    String::from_utf8(bytes).map_err(|_| ObjcError::Malformed {
         offset: name_va,
         detail: "class name not UTF-8",
     })
 }
 
 /// Own `+load` via the metaclass base methods (`cls->ISA()`).
-fn class_load(view: &View<'_>, class_va: u64) -> Result<Option<LoadMethod>> {
-    let coff = view.vma_to_off(class_va).ok_or(ObjcError::Malformed {
-        offset: class_va,
-        detail: "class outside image segments",
-    })?;
-    let isa = view.u64_at(coff)?;
+fn class_load<B: Backing>(view: &View<B>, class_va: u64) -> Result<Option<LoadMethod>> {
+    let isa = view.u64_va(class_va)?;
     if isa == 0 {
         return Err(ObjcError::Malformed {
             offset: class_va,
             detail: "class without metaclass",
         });
     }
-    let moff = view.vma_to_off(isa).ok_or(ObjcError::Malformed {
-        offset: isa,
-        detail: "metaclass outside image segments",
-    })?;
-    let data = view.u64_at(moff.checked_add(CLASS_DATA_OFFSET).ok_or(
-        ObjcError::Malformed {
-            offset: isa,
-            detail: "metaclass header overflows",
-        },
-    )?)? & FAST_DATA_MASK;
-    let ro = view.vma_to_off(data).ok_or(ObjcError::Malformed {
-        offset: data,
-        detail: "metaclass_ro outside image segments",
-    })?;
-    // class_ro must at least cover the baseMethods field.
-    if ro.checked_add(RO_MIN_SIZE).is_none_or(|end| end > view.bytes.len()) {
-        return Err(ObjcError::Truncated {
-            offset: ro,
-            len: view.bytes.len(),
-        });
-    }
-    let methods = view.u64_at(ro + RO_METHODS_OFFSET)?;
+    let data = view.u64_va(add_va(isa, CLASS_DATA_OFFSET)?)? & FAST_DATA_MASK;
+    let methods = view.u64_va(add_va(data, RO_METHODS_OFFSET)?)?;
     find_load(view, methods)
 }
 
-fn parse_class(view: &View<'_>, class_va: u64) -> Result<ClassRec> {
-    let coff = view.vma_to_off(class_va).ok_or(ObjcError::Malformed {
-        offset: class_va,
-        detail: "class outside image segments",
-    })?;
-    if coff.checked_add(CLASS_T_SIZE).is_none_or(|end| end > view.bytes.len()) {
-        return Err(ObjcError::Truncated {
-            offset: coff,
-            len: view.bytes.len(),
-        });
-    }
-    let superclass = view.u64_at(coff + CLASS_SUPER_OFFSET)?;
+fn parse_class<B: Backing>(view: &View<B>, class_va: u64) -> Result<ClassRec> {
+    // Touch the full struct so short mappings truncate cleanly.
+    view.u64_va(add_va(class_va, CLASS_T_SIZE - 8)?)?;
+    let superclass = view.u64_va(add_va(class_va, CLASS_SUPER_OFFSET)?)?;
     Ok(ClassRec {
         addr: class_va,
         name: class_name(view, class_va)?,
@@ -345,22 +346,13 @@ fn parse_class(view: &View<'_>, class_va: u64) -> Result<ClassRec> {
     })
 }
 
-fn parse_category(view: &View<'_>, cat_va: u64) -> Result<CategoryRec> {
-    let coff = view.vma_to_off(cat_va).ok_or(ObjcError::Malformed {
-        offset: cat_va,
-        detail: "category outside image segments",
-    })?;
-    if coff.checked_add(CATEGORY_T_SIZE).is_none_or(|end| end > view.bytes.len()) {
-        return Err(ObjcError::Truncated {
-            offset: coff,
-            len: view.bytes.len(),
-        });
-    }
-    let name_va = view.u64_at(coff)?;
-    let cls = view.u64_at(coff + CATEGORY_CLS_OFFSET)?;
-    let methods = view.u64_at(coff + CATEGORY_CLASS_METHODS_OFFSET)?;
+fn parse_category<B: Backing>(view: &View<B>, cat_va: u64) -> Result<CategoryRec> {
+    view.u64_va(add_va(cat_va, CATEGORY_T_SIZE - 8)?)?;
+    let name_va = view.u64_va(cat_va)?;
+    let cls = view.u64_va(add_va(cat_va, CATEGORY_CLS_OFFSET)?)?;
+    let methods = view.u64_va(add_va(cat_va, CATEGORY_CLASS_METHODS_OFFSET)?)?;
     let name_bytes = view.cstr_va(name_va)?;
-    let name = String::from_utf8(name_bytes.to_vec()).map_err(|_| ObjcError::Malformed {
+    let name = String::from_utf8(name_bytes).map_err(|_| ObjcError::Malformed {
         offset: name_va,
         detail: "category name not UTF-8",
     })?;
@@ -372,51 +364,79 @@ fn parse_category(view: &View<'_>, cat_va: u64) -> Result<CategoryRec> {
     })
 }
 
-/// Parse one image's ObjC metadata. Images without ObjC sections
-/// parse to empty records (plain C binaries).
-pub fn parse_image(bytes: &[u8], map: &LoadMap, slide: u64) -> Result<ObjcImage> {
-    let view = View::new(bytes, map, slide);
+fn list_entry(list_va: u64, i: u64) -> Result<u64> {
+    list_va
+        .checked_add(i.checked_mul(8).ok_or(ObjcError::Malformed {
+            offset: list_va,
+            detail: "list index overflows",
+        })?)
+        .ok_or(ObjcError::Malformed {
+            offset: list_va,
+            detail: "list entry overflows",
+        })
+}
+
+fn parse<B: Backing>(view: &View<B>, map: &LoadMap, slide: Option<u64>) -> Result<ObjcImage> {
+    // Section addrs are file VAs; mapped reads slide them.
+    let base = |sectname: &str| -> Result<Option<(u64, u64)>> {
+        match find_section(map, sectname) {
+            None => Ok(None),
+            Some((addr, size)) => {
+                let va = match slide {
+                    None => addr,
+                    Some(s) => addr.checked_add(s).ok_or(ObjcError::Malformed {
+                        offset: addr,
+                        detail: "section address overflows",
+                    })?,
+                };
+                Ok(Some((va, size)))
+            }
+        }
+    };
     let mut out = ObjcImage::default();
-    if let Some((addr, size)) = find_section(map, "__objc_classlist") {
-        let count = size / 8;
-        for i in 0..count {
-            let va = addr.checked_add(i.checked_mul(8).ok_or(ObjcError::Malformed {
-                offset: addr,
-                detail: "classlist index overflows",
-            })?).ok_or(ObjcError::Malformed {
-                offset: addr,
-                detail: "classlist entry overflows",
-            })?;
-            let class_va = view.u64_va(va)?;
+    if let Some((addr, size)) = base("__objc_classlist")? {
+        for i in 0..size / 8 {
+            let class_va = view.u64_va(list_entry(addr, i)?)?;
             if class_va == 0 {
                 continue;
             }
-            out.classes.push(parse_class(&view, class_va)?);
+            out.classes.push(parse_class(view, class_va)?);
         }
     }
-    if let Some((addr, size)) = find_section(map, "__objc_catlist") {
-        let count = size / 8;
-        for i in 0..count {
-            let va = addr.checked_add(i.checked_mul(8).ok_or(ObjcError::Malformed {
-                offset: addr,
-                detail: "catlist index overflows",
-            })?).ok_or(ObjcError::Malformed {
-                offset: addr,
-                detail: "catlist entry overflows",
-            })?;
-            let cat_va = view.u64_va(va)?;
+    if let Some((addr, size)) = base("__objc_catlist")? {
+        for i in 0..size / 8 {
+            let cat_va = view.u64_va(list_entry(addr, i)?)?;
             if cat_va == 0 {
                 continue;
             }
-            out.categories.push(parse_category(&view, cat_va)?);
+            out.categories.push(parse_category(view, cat_va)?);
         }
     }
     Ok(out)
 }
 
+/// Parse one image's ObjC metadata from file bytes. Images without
+/// ObjC sections parse to empty records (plain C binaries).
+pub fn parse_image(bytes: &[u8], map: &LoadMap) -> Result<ObjcImage> {
+    let view = View {
+        backing: FileBacking::new(bytes, map),
+    };
+    parse(&view, map, None)
+}
+
+/// Parse one image's ObjC metadata from live mapped memory (slid,
+/// post-fixup). The mapping must outlive the call.
+pub fn parse_mapped(map: &LoadMap, slide: u64) -> Result<ObjcImage> {
+    let view = View {
+        backing: MappedBacking::new(map, slide),
+    };
+    parse(&view, map, Some(slide))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mol_macho::map::MapSection;
 
     /// Minimal valid image: one class with a big-list `+load`.
     /// TEXT @0x1000 (file 0), DATA @0x2000 (file 0x1000).
@@ -507,7 +527,7 @@ mod tests {
     #[test]
     fn big_method_list_parses_load() {
         let (b, map) = tiny(true);
-        let img = parse_image(&b, &map, 0).unwrap();
+        let img = parse_image(&b, &map).unwrap();
         assert_eq!(img.classes.len(), 1);
         assert_eq!(img.classes[0].name, "Klass");
         assert_eq!(
@@ -522,7 +542,7 @@ mod tests {
     #[test]
     fn small_method_list_parses_load() {
         let (b, map) = tiny(false);
-        let img = parse_image(&b, &map, 0).unwrap();
+        let img = parse_image(&b, &map).unwrap();
         assert_eq!(img.classes.len(), 1);
         // entry 0x1208: name 0x1208-0x108, imp 0x1208-0x1f8.
         assert_eq!(
@@ -539,7 +559,7 @@ mod tests {
         let (mut b, map) = tiny(false);
         b[0x200..0x204].copy_from_slice(&0x8000_0010u32.to_le_bytes());
         assert!(matches!(
-            parse_image(&b, &map, 0).unwrap_err(),
+            parse_image(&b, &map).unwrap_err(),
             ObjcError::Malformed { .. }
         ));
     }
@@ -549,7 +569,7 @@ mod tests {
         let (mut b, map) = tiny(true);
         b[0x204..0x208].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
         assert!(matches!(
-            parse_image(&b, &map, 0).unwrap_err(),
+            parse_image(&b, &map).unwrap_err(),
             ObjcError::Malformed { .. }
         ));
     }
@@ -558,6 +578,47 @@ mod tests {
     fn dangling_class_pointer_is_malformed() {
         let (mut b, map) = tiny(true);
         b[0x1400..0x1408].copy_from_slice(&0x9u64.to_le_bytes());
-        assert!(parse_image(&b, &map, 0).is_err());
+        assert!(parse_image(&b, &map).is_err());
+    }
+
+    #[test]
+    fn mapped_window_reads_live_memory() {
+        // MappedBacking over a heap buffer: in-range reads see
+        // live bytes, out-of-range reads error (never fault).
+        let buf = vec![0x41u8; 64];
+        let base = buf.as_ptr() as u64;
+        let map = LoadMap {
+            cputype: 0,
+            cpusubtype: 0,
+            filetype: 0,
+            flags: 0,
+            slide: 0,
+            segments: vec![MapSegment {
+                segname: "__DATA".to_string(),
+                vmaddr: base,
+                vmsize: 64,
+                fileoff: 0,
+                filesize: 64,
+                maxprot: 3,
+                initprot: 3,
+                flags: 0,
+                sections: Vec::new(),
+            }],
+            entry: None,
+            routines: Vec::new(),
+            dylinker: None,
+            dylibs: Vec::new(),
+            uuid: None,
+            build: None,
+            codesign: None,
+            exports: Vec::new(),
+            fixups: Vec::new(),
+            unknown_cmds: Vec::new(),
+        };
+        let backing = MappedBacking::new(&map, 0);
+        assert_eq!(backing.window(base + 8, 4).unwrap(), &[0x41; 4]);
+        assert!(backing.window(base + 63, 2).is_err());
+        assert!(backing.window(base + 64, 1).is_err());
+        assert!(backing.window(0x1000, 1).is_err());
     }
 }
