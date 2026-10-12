@@ -312,7 +312,10 @@ impl<'a> ImageStore<'a> for FsStore {
     }
 }
 
-/// Random per-image ASLR slides (1MB granularity, 0..255MB).
+/// Random per-image ASLR slides (1MB granularity, 1..255MB).
+/// Never zero: zero-base images (dylibs link at 0, as does the mol
+/// shim) would otherwise map below `vm.mmap_min_addr` (64K) and fail
+/// with EPERM for non-root users.
 pub struct RandomSlide;
 
 impl SlidePolicy for RandomSlide {
@@ -322,9 +325,9 @@ impl SlidePolicy for RandomSlide {
         }
         let mut buf = [0u8; 8];
         if sys::getrandom(&mut buf).is_err() {
-            return 0;
+            return 0x10_0000;
         }
-        (u64::from_ne_bytes(buf) % 256) * 0x10_0000
+        (u64::from_ne_bytes(buf) % 255 + 1) * 0x10_0000
     }
 }
 

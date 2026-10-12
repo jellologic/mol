@@ -5,3 +5,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[dependencies]
+mol-syscall = { version = "0.1.0", path = "../mol-syscall" }
+
+[dev-dependencies]
+mol-macho = { version = "0.1.0", path = "../mol-macho" }

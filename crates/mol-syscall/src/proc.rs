@@ -20,6 +20,12 @@ pub fn getpid() -> i32 {
     crate::raw::getpid() as i32
 }
 
+/// Thread id for init-order evidence (not a guest export in P1.2).
+#[cfg(target_os = "linux")]
+pub fn gettid() -> u64 {
+    crate::raw::gettid()
+}
+
 /// `kill(pid, signo)` with Darwin signal numbers.
 #[cfg(target_os = "linux")]
 pub fn kill(pid: i32, signo: i32) -> Result<(), i32> {
