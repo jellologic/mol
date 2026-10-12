@@ -50,6 +50,9 @@ version = "0.1.0"
 [[package]]
 name = "mol-objc"
 version = "0.1.0"
+dependencies = [
+ "mol-macho",
+]
 
 [[package]]
 name = "mol-syscall"
