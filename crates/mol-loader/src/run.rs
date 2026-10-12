@@ -418,6 +418,9 @@ pub struct RunOptions {
     pub fixed_slide: Option<u64>,
     /// Guest stack size in bytes.
     pub stack_size: u64,
+    /// Install the raw-syscall fault catcher (SIGSEGV/SIGBUS/SIGILL
+    /// report to stderr) before mapping the guest.
+    pub debug_catch_faults: bool,
 }
 
 impl Default for RunOptions {
@@ -428,6 +431,7 @@ impl Default for RunOptions {
             sysroot: String::new(),
             fixed_slide: None,
             stack_size: 8 * 1024 * 1024,
+            debug_catch_faults: false,
         }
     }
 }
@@ -980,6 +984,12 @@ pub fn run_guest(path: &str, opts: &RunOptions) -> Result<()> {
                 // addresses for argc).
                 let (argc_val, argv_ptr, envp_ptr, apple_ptr) =
                     entry_args(image.sp, argv.len(), envp.len());
+                // After libSystem init, which resets SIGBUS/SIGSEGV
+                // to default: install the fault catcher last so it
+                // survives to guest entry.
+                if opts.debug_catch_faults {
+                    crate::faults::install();
+                }
                 // SAFETY: transfer diverges into mapped guest code.
                 unsafe {
                     transfer(
