@@ -283,7 +283,7 @@ struct Fixture {
 fn run(images: &[&Fixture]) -> (Vec<String>, Vec<(u64, u64, u64)>) {
     let parsed: Vec<mol_objc::meta::ObjcImage> = images
         .iter()
-        .map(|f| parse_image(&f.bytes, &f.map, 0).unwrap())
+        .map(|f| parse_image(&f.bytes, &f.map).unwrap())
         .collect();
     let mut st = prepare(&parsed);
     let mut seq = Vec::new();
