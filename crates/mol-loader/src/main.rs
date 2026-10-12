@@ -38,6 +38,7 @@ struct RunArgs {
     sysroot: Option<PathBuf>,
     slide: Option<u64>,
     stack_size: Option<u64>,
+    debug_catch_faults: bool,
     image: String,
     args: Vec<String>,
 }
@@ -58,6 +59,7 @@ fn parse_run(argv: &[String]) -> Result<RunArgs, String> {
         sysroot: None,
         slide: None,
         stack_size: None,
+        debug_catch_faults: false,
         image: String::new(),
         args: Vec::new(),
     };
@@ -93,6 +95,9 @@ fn parse_run(argv: &[String]) -> Result<RunArgs, String> {
                         .get(i)
                         .ok_or_else(|| "run: --stack-size needs a value".to_string())?;
                     out.stack_size = Some(parse_num(val, "--stack-size")?);
+                }
+                "--debug-catch-faults" => {
+                    out.debug_catch_faults = true;
                 }
                 other => return Err(format!("unexpected run flag '{other}'")),
             }
@@ -187,10 +192,13 @@ fn help_text() -> &'static str {
      \x20      --cache-dir C] -- <init> [args...]\n\
      \x20     boot an empty prefix: new mount+PID namespaces, overlay\n\
      \x20     merged view at <prefix>/merged, init exec'd as PID 1 (upper/work need overlay-capable fs)\n\
-     \x20 run [--sysroot S] [--slide N] [--stack-size N] <mach-o> [args...]\n\
+     \x20 run [--sysroot S] [--slide N] [--stack-size N]\n\
+     \x20     [--debug-catch-faults] <mach-o> [args...]\n\
      \x20     run a same-ISA Mach-O guest in-process (Linux-only);\n\
      \x20     --slide pins the main image slide (dylibs always random;\n\
-     \x20     hex or decimal, default random)\n"
+     \x20     hex or decimal, default random)\n\
+     \x20     --debug-catch-faults prints fault addr + PC on guest\n\
+     \x20     crashes, then re-raises the signal\n"
 }
 
 fn resolve_spec(args: &BootArgs) -> Result<PrefixSpec, String> {
@@ -315,6 +323,7 @@ fn run_guest_cmd(args: &RunArgs) -> i32 {
     if let Some(stack) = args.stack_size {
         opts.stack_size = stack;
     }
+    opts.debug_catch_faults = args.debug_catch_faults;
     // Diverges into the guest on success; returns only on error.
     match mol_loader::run::run_guest(&args.image, &opts) {
         Ok(()) => unreachable!("run_guest diverges on success"),
@@ -455,6 +464,7 @@ mod tests {
             "0x10000",
             "--stack-size",
             "16777216",
+            "--debug-catch-faults",
             "guest",
             "-a",
             "b",
@@ -464,6 +474,7 @@ mod tests {
                 assert_eq!(a.sysroot, Some(PathBuf::from("/p/merged")));
                 assert_eq!(a.slide, Some(0x10000));
                 assert_eq!(a.stack_size, Some(16777216));
+                assert!(a.debug_catch_faults);
                 assert_eq!(a.image, "guest");
                 assert_eq!(a.args, vec!["-a", "b"]);
             }

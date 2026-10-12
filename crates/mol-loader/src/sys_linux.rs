@@ -2,9 +2,10 @@
 //! Hand-rolled Linux syscalls for the loader (doc 25: no libc).
 //!
 //! Raw `syscall`/`svc` wrappers for x86_64 and AArch64 covering only
-//! what mapping + process control need: `mmap`, `mprotect`,
-//! `munmap`, `getrandom`, `exit_group`. Guest-facing emulation
-//! builds on this module in P1.2.
+//! what mapping + process control + fault diagnostics need:
+//! `mmap`, `mprotect`, `munmap`, `getrandom`, `exit_group`,
+//! `write`, `rt_sigaction`, `kill`, `getpid`. Guest-facing
+//! emulation builds on this module in P1.2.
 
 use core::arch::asm;
 
@@ -20,18 +21,30 @@ pub const MAP_FIXED_NOREPLACE: u64 = 0x100000;
 
 #[cfg(target_arch = "x86_64")]
 mod nr {
+    pub const WRITE: u64 = 1;
     pub const MMAP: u64 = 9;
     pub const MPROTECT: u64 = 10;
     pub const MUNMAP: u64 = 11;
+    pub const RT_SIGACTION: u64 = 13;
+    pub const RT_SIGPROCMASK: u64 = 14;
+    pub const KILL: u64 = 62;
+    pub const GETPID: u64 = 39;
     pub const GETRANDOM: u64 = 318;
+    pub const EXIT_GROUP: u64 = 231;
 }
 
 #[cfg(target_arch = "aarch64")]
 mod nr {
+    pub const WRITE: u64 = 64;
     pub const MMAP: u64 = 222;
     pub const MPROTECT: u64 = 226;
     pub const MUNMAP: u64 = 215;
+    pub const RT_SIGACTION: u64 = 134;
+    pub const RT_SIGPROCMASK: u64 = 135;
+    pub const KILL: u64 = 129;
+    pub const GETPID: u64 = 172;
     pub const GETRANDOM: u64 = 278;
+    pub const EXIT_GROUP: u64 = 94;
 }
 
 /// Raw 6-arg syscall. Returns the kernel return value (negative
@@ -87,6 +100,68 @@ fn check(ret: i64) -> Result<u64, i32> {
     } else {
         Ok(ret as u64)
     }
+}
+
+/// Write to a file descriptor.
+pub fn write(fd: u64, buf: u64, len: u64) -> Result<u64, i32> {
+    // SAFETY: caller-supplied valid buffer.
+    check(unsafe { syscall6(nr::WRITE, fd, buf, len, 0, 0, 0) })
+}
+
+/// Install a signal disposition (`sigsetsize` must be 8).
+pub fn rt_sigaction(sig: u64, act: u64, oldact: u64) -> Result<u64, i32> {
+    // SAFETY: caller-supplied valid sigaction structs.
+    check(unsafe { syscall6(nr::RT_SIGACTION, sig, act, oldact, 8, 0, 0) })
+}
+
+/// Send a signal to a process.
+pub fn kill(pid: u64, sig: u64) -> Result<u64, i32> {
+    // SAFETY: numbers only.
+    check(unsafe { syscall6(nr::KILL, pid, sig, 0, 0, 0, 0) })
+}
+
+/// `rt_sigprocmask` `how` to remove signals from the mask.
+pub const SIG_UNBLOCK: u64 = 1;
+
+/// Change the calling thread's signal mask (`sigsetsize` is 8).
+pub fn rt_sigprocmask(how: u64, set: u64, oldset: u64) -> Result<u64, i32> {
+    // SAFETY: caller-supplied valid mask pointers.
+    check(unsafe { syscall6(nr::RT_SIGPROCMASK, how, set, oldset, 8, 0, 0) })
+}
+
+/// Calling process id.
+pub fn getpid() -> u64 {
+    // SAFETY: numbers only.
+    unsafe { syscall6(nr::GETPID, 0, 0, 0, 0, 0, 0) as u64 }
+}
+
+/// Terminate the process group with a status. Diverges.
+pub fn exit_group(status: u64) -> ! {
+    // SAFETY: diverges.
+    unsafe {
+        syscall6(nr::EXIT_GROUP, status, 0, 0, 0, 0, 0);
+        core::hint::unreachable_unchecked()
+    }
+}
+
+// `rt_sigreturn` trampoline for x86_64 signal delivery (same shape
+// as mol-syscall's): the kernel has no return trampoline of its
+// own, so `SA_RESTORER` must point here. arm64 returns via the
+// kernel's own trampoline and never calls this.
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    ".globl mol_loader_sig_restorer",
+    "mol_loader_sig_restorer:",
+    "mov rax, 15", // __NR_rt_sigreturn
+    "syscall",
+    ".size mol_loader_sig_restorer, .-mol_loader_sig_restorer",
+);
+
+unsafe extern "C" {
+    /// Address of the x86_64 restorer above. Only its address is
+    /// ever taken; it is never called from Rust.
+    #[cfg(target_arch = "x86_64")]
+    pub fn mol_loader_sig_restorer();
 }
 
 /// Anonymous mapping anywhere the kernel chooses.

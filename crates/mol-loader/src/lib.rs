@@ -5,6 +5,8 @@
 //! Load maps must zero-diff against `otool -l` / `dyld_info` on the
 //! thin+fat corpus (P1.1.V1). No framework code lives here.
 
+#[cfg(target_os = "linux")]
+pub mod faults;
 pub mod prefix;
 #[cfg(target_os = "linux")]
 pub mod run;

@@ -44,6 +44,8 @@ fn run(path: &std::path::Path) -> Output {
         .arg("run")
         .arg("--slide")
         .arg("0")
+        // Fault diagnostics only; silent when green.
+        .arg("--debug-catch-faults")
         .arg(path)
         .output()
         .expect("spawn mol-loader")
@@ -825,6 +827,44 @@ fn t7_ceil_half_is_one() {
 // ---------------------------------------------------------------------------
 // T8: libSystem init order is visible on stderr.
 // ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "aarch64")]
+fn fault_code() -> Vec<u8> {
+    let mut c = vec![];
+    a_movz(&mut c, 0, 0, 0, true);
+    a_ldr_x(&mut c, 0, 0); // ldr x0, [x0] with x0 == 0
+    c
+}
+
+#[cfg(target_arch = "x86_64")]
+fn fault_code() -> Vec<u8> {
+    let mut c = vec![];
+    x_mov_r32_imm(&mut c, 0, 0);
+    x_load_eax_rax(&mut c); // mov eax, [rax] with rax == 0
+    c
+}
+
+#[test]
+fn fault_catcher_reports_segv() {
+    let (ct, st) = host_cpu();
+    let img = build_import_guest(ct, st, &["_exit"], &fault_code(), &[]);
+    let path = write_guest("fault", &img);
+    let out = run(&path);
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(
+        out.status.signal(),
+        Some(11),
+        "code {:?} stderr {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("fatal signal 11"), "stderr:\n{err}");
+    assert!(err.contains("addr 0x0000000000000000"), "stderr:\n{err}");
+    // PC lands inside the guest entry page (proves the ucontext
+    // offset, not just the signal).
+    assert!(err.contains("pc 0x0000000010001"), "stderr:\n{err}");
+}
 
 #[test]
 fn t8_init_order_on_stderr() {
