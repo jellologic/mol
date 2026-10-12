@@ -1,0 +1,44 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# commit-msg hook: every commit must reference the plan tracker,
+# e.g. subject "[P1.1] loader parses thin Mach-O" or a
+# "Tracker: P1.1.1, P1.1.V1" trailer. Merge commits are exempt.
+# Emergency escape: git commit --no-verify.
+set -u
+msg="$1"
+
+case "$(head -n 1 "$msg")" in
+  "Merge "*) exit 0 ;;
+esac
+
+root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+[ -d "$root/docs" ] || exit 0
+
+REF='(P[0-9]+|PG)(\.[0-9]+)?(\.(V[0-9]+|[0-9]+))?'
+if grep -Eq "\[$REF\]" "$msg" || grep -Eq "^Tracker: .+$" "$msg"; then
+  # Verify each referenced id actually exists in the tracker.
+  refs="$(grep -Eo "\[$REF\]|Tracker: .+$" "$msg" \
+    | grep -Eo "$REF" | sort -u)"
+  bad=0
+  for r in $refs; do
+    dots="$(printf '%s' "$r" | tr -cd '.' | wc -c)"
+    if [ "$dots" -ge 2 ]; then
+      grep -rq -- "- \[[ x]\] $r" "$root/docs" || {
+        echo "commit rejected: unknown tracker id '$r'" >&2; bad=1; }
+    elif [ "$dots" -eq 1 ]; then
+      ls "$root"/docs/*-subphase-"$r"-*.md >/dev/null 2>&1 || {
+        echo "commit rejected: unknown sub-phase '$r'" >&2; bad=1; }
+    else
+      ls "$root"/docs/*-phase-"$r"-*.md >/dev/null 2>&1 || {
+        echo "commit rejected: unknown phase '$r'" >&2; bad=1; }
+    fi
+  done
+  [ "$bad" -eq 0 ] || exit 1
+  exit 0
+fi
+
+echo "commit rejected: reference the plan tracker." >&2
+echo "  subject: [P1.1] loader parses thin Mach-O" >&2
+echo "  or add trailer: Tracker: P1.1.1, P1.1.V1" >&2
+echo "  (merge commits exempt; --no-verify escapes)" >&2
+exit 1

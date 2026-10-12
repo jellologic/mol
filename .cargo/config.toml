@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# P0.2 repo tooling. Vendor source replacement (doc 28) merges here
+# with the first third-party dependency (P1 at earliest).
+[alias]
+xtask = "run --package xtask --"

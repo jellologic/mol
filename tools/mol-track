@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
+"""mol-track: progress tracker for the mol implementation plan.
+
+Single source of truth: checkboxes in docs/38-63 (sub-phase docs).
+Status and reports are always derived, never stored, so the milestone
+map (doc 29) cannot drift out of sync.
+
+Usage:
+    tools/mol-track status [--phase P1]
+    tools/mol-track check P1.1.1 [P1.1.V1 ...]
+    tools/mol-track uncheck P1.1.1
+    tools/mol-track validate
+    tools/mol-track report
+"""
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+DOCS = ROOT / "docs"
+
+ID_RE = re.compile(r"^(P\d+|PG)\.\d+\.(V\d+|\d+)$")
+BOX_RE = re.compile(r"^- \[( |x)\] ((?:P\d+|PG)\.\d+\.(?:V\d+|\d+))\b")
+LINK_RE = re.compile(r"\]\(([A-Za-z0-9_./-]+\.md)\)")
+SUBPHASE_GLOB = "*-subphase-*.md"
+
+
+def subphase_files():
+    files = sorted(DOCS.glob(SUBPHASE_GLOB))
+    if not files:
+        sys.exit("error: no sub-phase docs found in docs/")
+    return files
+
+
+def subphase_id_of(path):
+    m = re.search(r"subphase-((?:P\d+|PG)\.\d+)-", path.name)
+    return m.group(1) if m else None
+
+
+def boxes_in(path):
+    """Return list of (line_no, checked, box_id) for checkbox lines."""
+    out = []
+    for i, line in enumerate(path.read_text().splitlines(), 1):
+        m = BOX_RE.match(line)
+        if m:
+            out.append((i, m.group(1) == "x", m.group(2)))
+    return out
+
+
+def milestone_of(path):
+    """Join the wrapped 'Milestone:' paragraph (ends at 'Proven by:')."""
+    lines = path.read_text().splitlines()
+    buf, capture = [], False
+    for line in lines:
+        if line.startswith("Milestone:"):
+            capture = True
+            buf.append(line[len("Milestone:"):].strip())
+        elif capture:
+            if line.startswith("Proven by:") or not line.strip():
+                break
+            buf.append(line.strip())
+    return " ".join(buf)
+
+
+def collect():
+    """Per-sub-phase data: (doc_no, sub_id, path, milestone, boxes)."""
+    rows = []
+    for path in subphase_files():
+        doc_no = path.name.split("-")[0]
+        rows.append((doc_no, subphase_id_of(path), path,
+                     milestone_of(path), boxes_in(path)))
+    return rows
+
+
+def cmd_status(args):
+    rows = collect()
+    if args.phase:
+        rows = [r for r in rows if r[1].split(".")[0] == args.phase]
+        if not rows:
+            sys.exit(f"error: unknown phase '{args.phase}'")
+    total_open = total_done = green = 0
+    print(f"{'Sub':<6}{'Doc':<5}{'Milestone':<62}{'Done':<7}Proof")
+    for doc_no, sub_id, _path, ms, boxes in rows:
+        done = sum(1 for _l, c, _i in boxes if c)
+        total = len(boxes)
+        total_open += total - done
+        total_done += done
+        proof = "GREEN" if total and done == total else "red"
+        if proof == "GREEN":
+            green += 1
+        ms_short = ms if len(ms) <= 60 else ms[:57] + "..."
+        print(f"{sub_id:<6}{doc_no:<5}{ms_short:<62}{done}/{total:<6}{proof}")
+    total = total_open + total_done
+    pct = (100 * total_done // total) if total else 0
+    print(f"\nTotal: {total_done}/{total} ({pct}%)  "
+          f"Milestones green: {green}/{len(rows)}")
+    return 0
+
+
+def flip(ids, to_checked):
+    want = "x" if to_checked else " "
+    verb = "checked" if to_checked else "unchecked"
+    rows = collect()
+    by_id = {}
+    for _doc_no, _sub, path, _ms, boxes in rows:
+        for line_no, checked, box_id in boxes:
+            by_id.setdefault(box_id, []).append((path, line_no, checked))
+    rc = 0
+    for box_id in ids:
+        if not ID_RE.match(box_id):
+            print(f"error: bad id format '{box_id}'", file=sys.stderr)
+            rc = 1
+            continue
+        found = by_id.get(box_id, [])
+        if not found:
+            print(f"error: unknown id '{box_id}'", file=sys.stderr)
+            rc = 1
+            continue
+        if len(found) > 1:
+            print(f"error: id '{box_id}' is ambiguous "
+                  f"({len(found)} hits); run validate", file=sys.stderr)
+            rc = 1
+            continue
+        path, line_no, checked = found[0]
+        if checked == to_checked:
+            print(f"note: {box_id} already {verb}")
+            continue
+        lines = path.read_text().splitlines(keepends=True)
+        lines[line_no - 1] = re.sub(r"^- \[( |x)\]",
+                                    f"- [{want}]", lines[line_no - 1], count=1)
+        path.write_text("".join(lines))
+        print(f"{verb}: {box_id} ({path.name})")
+    return rc
+
+
+def cmd_validate(_args):
+    errors = []
+
+    # 1. Every internal .md link resolves.
+    for md in sorted(DOCS.glob("*.md")):
+        for target in LINK_RE.findall(md.read_text()):
+            if not (DOCS / target).is_file():
+                errors.append(f"{md.name}: broken link to {target}")
+
+    # 2. Checkbox ids are well-formed and unique.
+    seen = {}
+    for _doc_no, sub_id, path, _ms, boxes in collect():
+        for _line_no, _checked, box_id in boxes:
+            if not ID_RE.match(box_id):
+                errors.append(f"{path.name}: malformed id '{box_id}'")
+            if box_id in seen:
+                errors.append(f"duplicate id '{box_id}' "
+                              f"({seen[box_id]} and {path.name})")
+            else:
+                seen[box_id] = path.name
+            # 3. Each id lives in its own sub-phase doc.
+            if sub_id and not box_id.startswith(sub_id + "."):
+                errors.append(f"{path.name}: id '{box_id}' misfiled "
+                              f"(expected prefix {sub_id}.)")
+
+    # 4. Every sub-phase doc is linked from the milestone map (doc 29).
+    plan = (DOCS / "29-implementation-plan.md").read_text()
+    for path in subphase_files():
+        if path.name not in plan:
+            errors.append(f"{path.name}: not linked from doc 29")
+
+    # 5. Every sub-phase doc states Milestone + Proven by.
+    for path in subphase_files():
+        text = path.read_text()
+        if "Milestone:" not in text:
+            errors.append(f"{path.name}: missing Milestone line")
+        if "Proven by:" not in text:
+            errors.append(f"{path.name}: missing Proven by line")
+
+    if errors:
+        print(f"{len(errors)} problem(s):")
+        for e in errors:
+            print(f"  - {e}")
+        return 1
+    print(f"OK: {len(subphase_files())} sub-phase docs, "
+          f"{len(seen)} ids, all links resolve.")
+    return 0
+
+
+def cmd_report(_args):
+    rows = collect()
+    phases = {}
+    for _doc_no, sub_id, _p, _m, boxes in rows:
+        ph = sub_id.split(".")[0]
+        d = phases.setdefault(ph, {"done": 0, "total": 0, "green": 0,
+                                   "subs": 0})
+        done = sum(1 for _l, c, _i in boxes if c)
+        d["done"] += done
+        d["total"] += len(boxes)
+        d["subs"] += 1
+        if boxes and done == len(boxes):
+            d["green"] += 1
+    print("# mol progress report\n")
+    print("| Phase | Boxes done | Milestones green |")
+    print("|-------|------------|------------------|")
+    td = tt = tg = ts = 0
+    for ph in sorted(phases, key=lambda p: (p == "PG", p)):
+        d = phases[ph]
+        pct = 100 * d["done"] // d["total"] if d["total"] else 0
+        print(f"| {ph} | {d['done']}/{d['total']} ({pct}%) "
+              f"| {d['green']}/{d['subs']} |")
+        td += d["done"]
+        tt += d["total"]
+        tg += d["green"]
+        ts += d["subs"]
+    pct = 100 * td // tt if tt else 0
+    print(f"\nOverall: {td}/{tt} boxes ({pct}%), "
+          f"{tg}/{ts} milestones green.")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="mol-track",
+                                 description="mol plan progress tracker")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("status", help="show per-milestone progress")
+    p.add_argument("--phase", help="limit to one phase, e.g. P1")
+    p = sub.add_parser("check", help="tick checkbox(es) by id")
+    p.add_argument("ids", nargs="+", help="e.g. P1.1.1 P1.1.V1")
+    p = sub.add_parser("uncheck", help="untick checkbox(es) by id")
+    p.add_argument("ids", nargs="+")
+    sub.add_parser("validate", help="check links, ids, map coverage")
+    sub.add_parser("report", help="markdown progress summary")
+    args = ap.parse_args(argv)
+    if args.cmd == "status":
+        return cmd_status(args)
+    if args.cmd == "check":
+        return flip(args.ids, True)
+    if args.cmd == "uncheck":
+        return flip(args.ids, False)
+    if args.cmd == "validate":
+        return cmd_validate(args)
+    if args.cmd == "report":
+        return cmd_report(args)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

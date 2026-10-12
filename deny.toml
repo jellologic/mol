@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# mol supply-chain policy (P0.1.2; see docs 23, 28).
+# Field names follow the `cargo deny init` template (cargo-deny 0.20).
+
+[graph]
+# Only the targets mol ships are checked.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+[advisories]
+# Defaults: vulnerabilities from the RustSec DB fail the check.
+
+[licenses]
+# Allow-list only: anything unlisted fails the check.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+]
+
+[bans]
+# Duplicate crate versions fail: minimalism is enforced, not wished for.
+multiple-versions = "deny"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

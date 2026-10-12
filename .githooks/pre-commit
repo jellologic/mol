@@ -1,0 +1,17 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# pre-commit hook: the tracker docs must validate (links resolve,
+# checkbox ids unique and well-formed, milestone map covers every
+# sub-phase doc). Emergency escape: git commit --no-verify.
+set -u
+root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+tool="$root/tools/mol-track"
+if [ ! -x "$tool" ]; then
+  echo "pre-commit: $tool missing or not executable" >&2
+  exit 1
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "pre-commit: python3 is required to validate the tracker" >&2
+  exit 1
+fi
+exec "$tool" validate

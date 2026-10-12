@@ -1,0 +1,37 @@
+{
+  "backends": {
+    "dtruss": {
+      "reason": "needs root",
+      "status": "skipped"
+    },
+    "dyld": {
+      "exit": 0,
+      "output": "hello-harness\n",
+      "status": "ok"
+    },
+    "exec": {
+      "status": "ok"
+    },
+    "lldb": {
+      "reason": "lldb attach denied (attach failed)",
+      "status": "skipped"
+    },
+    "log": {
+      "output": "Timestamp               Ty Process[PID:TID]\n",
+      "status": "ok"
+    },
+    "xctrace": {
+      "reason": "xctrace shim needs full Xcode (CLT only)",
+      "status": "skipped"
+    }
+  },
+  "command": [
+    "/bin/echo",
+    "hello-harness"
+  ],
+  "duration_ms": 2,
+  "exit": 0,
+  "stderr": "",
+  "stdout": "hello-harness\n",
+  "timeout": false
+}

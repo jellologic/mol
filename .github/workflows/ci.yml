@@ -1,0 +1,83 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# P0.1 policy job + P0.2 arch-matrix job + P0.4 dual-leg harness jobs
+# (docs 38, 39, 41).
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  policy:
+    name: supply-chain policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - name: Install audit tools
+        run: cargo install --locked cargo-deny cargo-audit
+      - name: cargo deny check
+        run: cargo deny check
+      - name: cargo audit
+        run: cargo audit --deny warnings
+
+  matrix:
+    name: arch matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - name: Arch matrix check
+        run: sh ./check.sh
+
+  legs:
+    name: harness leg (${{ matrix.leg }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            leg: mac
+          - os: ubuntu-latest
+            leg: ubuntu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Harness unit tests
+        run: python3 tools/mol_harness_tests.py
+      - name: Run smoke leg
+        run: >
+          python3 tools/mol-harness validate-def tests/harness/smoke-echo.json
+          && python3 tools/mol-harness run tests/harness/smoke-echo.json
+          --leg ${{ matrix.leg }} --out results
+      - uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ matrix.leg }}
+          path: results/
+
+  compare:
+    name: harness compare
+    needs: [legs]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: results-mac
+          path: cm/mac
+      - uses: actions/download-artifact@v4
+        with:
+          name: results-ubuntu
+          path: cm/linux
+      - name: Compare legs
+        run: python3 tools/mol-harness compare cm/mac cm/linux --out cm

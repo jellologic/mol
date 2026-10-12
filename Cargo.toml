@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# mol workspace root. Member crates land in P0.2 (doc 39).
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/mol-macho",
+    "crates/mol-loader",
+    "crates/mol-dyld",
+    "crates/mol-syscall",
+    "crates/mol-mach",
+    "crates/mol-xpc",
+    "crates/mol-libsystem",
+    "crates/mol-objc",
+    "crates/mol-metal-vk",
+    "crates/mol-launchd",
+    "crates/mol-bridge",
+    "crates/xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jellologic/mol"

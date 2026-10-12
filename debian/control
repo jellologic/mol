@@ -1,0 +1,13 @@
+Source: mol
+Section: utils
+Priority: optional
+Maintainer: jellologic <31935831+jellologic@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13), cargo:native, rustc:native
+Rules-Requires-Root: no
+
+Package: mol
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: macOS compatibility layer for Linux (skeleton)
+ Ground-up Rust reimplementation of the macOS userland ABI for
+ Ubuntu Desktop. P0 skeleton: loader entry point only.

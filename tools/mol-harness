@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
+"""mol-harness: dual-leg test runner + compare job (P0.4 skeleton).
+
+Test defs are JSON, a strict subset of YAML 1.2, so they stay valid
+when full-YAML parsing arrives; hand-rolling YAML is forbidden
+(doc 26) and this tool is stdlib-only by design. Schema: doc 17 +
+optional `expect_exit` (default 0) so JUnit can pass/fail a leg.
+
+Subcommands: validate-def | run | compare. See docs 17, 20, 41.
+"""
+import argparse
+import difflib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+MOL_TRACE = HERE / "mol-trace"
+
+PLATFORMS = ("mac", "ubuntu")
+ARTIFACTS = ("stdout", "stderr", "exit", "trace")
+NORMALIZE = ("strip-timing", "strip-paths", "sort-lines")
+
+
+def fail(msg):
+    print(f"mol-harness: {msg}", file=sys.stderr)
+    return 1
+
+
+def validate_def(defn, path):
+    errors = []
+    if not isinstance(defn.get("id"), str) or not defn["id"]:
+        errors.append(f"{path}: 'id' must be a non-empty string")
+    cmd = defn.get("command")
+    if (not isinstance(cmd, list) or not cmd
+            or not all(isinstance(a, str) for a in cmd)):
+        errors.append(
+            f"{path}: 'command' must be a non-empty argv list (no shell)")
+    plats = defn.get("platforms")
+    if (not isinstance(plats, list) or not plats
+            or any(p not in PLATFORMS for p in plats)):
+        errors.append(
+            f"{path}: 'platforms' must be a non-empty subset of "
+            f"{list(PLATFORMS)}")
+    timeout = defn.get("timeout_s")
+    if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
+        errors.append(f"{path}: 'timeout_s' must be a positive integer")
+    arts = defn.get("artifacts")
+    if (not isinstance(arts, list) or not arts
+            or any(a not in ARTIFACTS for a in arts)):
+        errors.append(
+            f"{path}: 'artifacts' must be a non-empty subset of "
+            f"{list(ARTIFACTS)}")
+    rules = defn.get("normalize", [])
+    if not isinstance(rules, list) or any(r not in NORMALIZE for r in rules):
+        errors.append(
+            f"{path}: 'normalize' must be a subset of {list(NORMALIZE)}")
+    if defn.get("baseline", "per-platform") != "per-platform":
+        errors.append(f"{path}: 'baseline' must be 'per-platform'")
+    expect = defn.get("expect_exit", 0)
+    if not isinstance(expect, int) or isinstance(expect, bool):
+        errors.append(f"{path}: 'expect_exit' must be an integer")
+    return errors
+
+
+def load_def(path):
+    try:
+        with open(path) as f:
+            defn = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        return None, [f"{path}: cannot parse test def as JSON: {e}"]
+    if not isinstance(defn, dict):
+        return None, [f"{path}: test def must be a JSON object"]
+    return defn, validate_def(defn, path)
+
+
+def write_junit(path, test_id, leg, duration_ms, ok, message):
+    suite = ET.Element("testsuite", {
+        "name": test_id, "tests": "1",
+        "failures": "0" if ok else "1",
+        "time": f"{duration_ms / 1000:.3f}",
+    })
+    case = ET.SubElement(suite, "testcase", {
+        "classname": leg, "name": test_id,
+        "time": f"{duration_ms / 1000:.3f}",
+    })
+    if not ok:
+        fail_el = ET.SubElement(case, "failure", {"message": message})
+        fail_el.text = message
+    tree = ET.ElementTree(suite)
+    ET.indent(tree)
+    tree.write(path, encoding="utf-8", xml_declaration=True)
+
+
+def cmd_run(args):
+    defn, errors = load_def(args.def_file)
+    if errors:
+        for e in errors:
+            print(f"mol-harness: {e}", file=sys.stderr)
+        return 1
+    if args.leg not in defn["platforms"]:
+        return fail(f"leg '{args.leg}' not in platforms {defn['platforms']}")
+    outdir = Path(args.out)
+    outdir.mkdir(parents=True, exist_ok=True)
+    # Single execution path: mol-trace collects stdout/stderr/exit/trace.
+    cmd = [sys.executable, str(MOL_TRACE), "collect",
+           "--out", str(outdir), "--timeout", str(defn["timeout_s"]),
+           "--", *defn["command"]]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        print(proc.stdout, end="")
+        print(proc.stderr, end="", file=sys.stderr)
+        return fail(f"trace collection failed for {defn['id']}")
+    with open(outdir / "trace.json") as f:
+        trace = json.load(f)
+    artifacts = {
+        "id": defn["id"],
+        "leg": args.leg,
+        "argv": defn["command"],
+        "platform": sys.platform,
+        "normalize": defn.get("normalize", []),
+        "stdout": trace["stdout"],
+        "stderr": trace["stderr"],
+        "exit": trace["exit"],
+        "timeout": trace.get("timeout", False),
+        "duration_ms": trace["duration_ms"],
+        "trace_backends": {k: v.get("status", "?")
+                           for k, v in trace.get("backends", {}).items()},
+    }
+    for key in ("stdout", "stderr", "exit"):
+        if key not in defn["artifacts"]:
+            artifacts[key] = None
+    if "trace" not in defn["artifacts"]:
+        artifacts["trace_backends"] = None
+        (outdir / "trace.json").unlink(missing_ok=True)
+    with open(outdir / "artifacts.json", "w") as f:
+        json.dump(artifacts, f, indent=2, sort_keys=True)
+    expect = defn.get("expect_exit", 0)
+    ok = not artifacts["timeout"] and artifacts["exit"] == expect
+    msg = ("ok" if ok else
+           f"exit={artifacts['exit']} timeout={artifacts['timeout']} "
+           f"(expected exit {expect})")
+    write_junit(outdir / "results.xml", defn["id"], args.leg,
+                trace["duration_ms"], ok, msg)
+    print(f"{args.leg}: exit={artifacts['exit']} "
+          f"timeout={artifacts['timeout']} ({msg})")
+    return 0
+
+
+def apply_normalize(doc, rules, repl):
+    """Canonical comparison form. Trace content is excluded: per doc 20,
+    traces compare only against same-platform baselines, never cross-leg."""
+    out = {
+        "id": doc["id"],
+        "argv": doc["argv"],
+        "stdout": doc["stdout"] or "",
+        "stderr": doc["stderr"] or "",
+        "exit": doc["exit"],
+    }
+    if "sort-lines" in rules:
+        out["stdout"] = "\n".join(sorted(out["stdout"].splitlines()))
+        out["stderr"] = "\n".join(sorted(out["stderr"].splitlines()))
+    if "strip-paths" in rules:
+        for text_key in ("stdout", "stderr"):
+            text = out[text_key]
+            for token, value in repl:
+                if value:
+                    text = text.replace(value, token)
+            out[text_key] = text
+    # strip-timing: duration_ms never enters the canonical form.
+    return out
+
+
+def leg_repl(leg_dir):
+    return [("$OUT", str(Path(leg_dir).resolve())),
+            ("$TMP", tempfile.gettempdir()),
+            ("$HOME", os.path.expanduser("~"))]
+
+
+def cmd_compare(args):
+    def load_leg(d):
+        with open(Path(d) / "artifacts.json") as f:
+            return json.load(f)
+    try:
+        mac = load_leg(args.mac_results)
+        linux = load_leg(args.linux_results)
+    except (OSError, json.JSONDecodeError) as e:
+        return fail(f"cannot load leg results: {e}")
+    if mac["id"] != linux["id"]:
+        return fail(f"leg test mismatch: {mac['id']} vs {linux['id']}")
+    rules = sorted(set(mac.get("normalize", []))
+                   | set(linux.get("normalize", [])))
+    canon_mac = apply_normalize(mac, rules, leg_repl(args.mac_results))
+    canon_linux = apply_normalize(linux, rules, leg_repl(args.linux_results))
+    diff = None
+    if mac.get("timeout") or linux.get("timeout"):
+        verdict = "DIVERGE"
+        note = "a leg timed out; no behavioral evidence to compare"
+    elif canon_mac == canon_linux:
+        verdict = "MATCH"
+        note = "normalized outputs identical"
+    else:
+        verdict = "DIVERGE"
+        note = "normalized outputs differ"
+        pretty_mac = json.dumps(canon_mac, indent=2, sort_keys=True).splitlines()
+        pretty_linux = json.dumps(canon_linux, indent=2, sort_keys=True).splitlines()
+        diff = "\n".join(difflib.unified_diff(
+            pretty_mac, pretty_linux, fromfile="mac", tofile="linux"))
+    prior_verdict = None
+    if args.prior:
+        try:
+            with open(args.prior) as f:
+                prior_verdict = json.load(f).get("verdict")
+        except (OSError, json.JSONDecodeError) as e:
+            return fail(f"cannot load prior verdict: {e}")
+        if prior_verdict != verdict:
+            verdict = "FLAKE"
+            note = (f"verdict flipped {prior_verdict} -> "
+                    f"{'MATCH' if prior_verdict == 'DIVERGE' else 'DIVERGE'} "
+                    f"on the same inputs; quarantine lane (advisory only)")
+    outdir = Path(args.out)
+    outdir.mkdir(parents=True, exist_ok=True)
+    with open(outdir / "verdict.json", "w") as f:
+        json.dump({"test": mac["id"], "verdict": verdict,
+                   "legs": {"mac": args.mac_results,
+                            "linux": args.linux_results},
+                   "rules": rules, "prior": prior_verdict,
+                   "note": note, "diff": diff},
+                  f, indent=2, sort_keys=True)
+    print(f"{mac['id']}: {verdict} ({note})")
+    if diff:
+        print(diff)
+    if verdict == "FLAKE":
+        print("quarantine: advisory only, never gating (doc 17)")
+    return 0 if verdict in ("MATCH", "FLAKE") else 1
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="mol-harness",
+                                 description="dual-leg test runner + compare")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("validate-def", help="check a test definition")
+    p.add_argument("def_file")
+    p = sub.add_parser("run", help="run one leg, emit JUnit + artifacts")
+    p.add_argument("def_file")
+    p.add_argument("--leg", required=True, choices=PLATFORMS)
+    p.add_argument("--out", required=True, help="output dir for this leg")
+    p = sub.add_parser("compare", help="verdict MATCH/DIVERGE/FLAKE")
+    p.add_argument("mac_results", help="dir with mac artifacts.json")
+    p.add_argument("linux_results", help="dir with linux artifacts.json")
+    p.add_argument("--out", default=".", help="dir for verdict.json")
+    p.add_argument("--prior", default=None,
+                   help="prior verdict.json for FLAKE detection")
+    args = ap.parse_args(argv)
+    if args.cmd == "validate-def":
+        _defn, errors = load_def(args.def_file)
+        for e in errors:
+            print(f"mol-harness: {e}", file=sys.stderr)
+        if not errors:
+            print(f"{args.def_file}: valid")
+        return 1 if errors else 0
+    if args.cmd == "run":
+        return cmd_run(args)
+    if args.cmd == "compare":
+        return cmd_compare(args)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

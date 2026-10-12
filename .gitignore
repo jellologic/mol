@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# P0.2 hygiene (filed during P0.3; build outputs must never be committed).
+/target/
+*.dsc
+*.deb
+*.buildinfo
+*.changes
+*.tar.xz
+__pycache__/
+*.pyc
+.DS_Store
+/results/

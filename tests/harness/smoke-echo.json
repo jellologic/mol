@@ -1,0 +1,10 @@
+{
+  "id": "harness/smoke/echo",
+  "command": ["/bin/echo", "hello-harness"],
+  "platforms": ["mac", "ubuntu"],
+  "timeout_s": 60,
+  "artifacts": ["stdout", "stderr", "exit", "trace"],
+  "normalize": ["strip-timing", "strip-paths", "sort-lines"],
+  "baseline": "per-platform",
+  "expect_exit": 0
+}

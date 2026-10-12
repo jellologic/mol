@@ -1,0 +1,27 @@
+{
+  "argv": [
+    "/bin/echo",
+    "hello-harness"
+  ],
+  "duration_ms": 2,
+  "exit": 0,
+  "id": "harness/smoke/echo",
+  "leg": "mac",
+  "normalize": [
+    "strip-timing",
+    "strip-paths",
+    "sort-lines"
+  ],
+  "platform": "darwin",
+  "stderr": "",
+  "stdout": "hello-harness\n",
+  "timeout": false,
+  "trace_backends": {
+    "dtruss": "skipped",
+    "dyld": "ok",
+    "exec": "ok",
+    "lldb": "skipped",
+    "log": "ok",
+    "xctrace": "skipped"
+  }
+}

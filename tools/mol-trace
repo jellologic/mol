@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
+"""mol-trace: oracle trace collector prototype (P0.4.2 seed).
+
+Runs one command and captures stdout/stderr/exit plus per-backend
+traces. Backends degrade to `skipped` with a reason when the
+platform lacks them (no root/Xcode/lldb here); a backend never
+crashes collection. Syscall-trace backends (lldb/xctrace/dtruss)
+are real implementations but their green paths are UNVERIFIED on
+this machine (lldb attach denied: developer mode off; xctrace not
+installed; no root) — GHA-oracle verification pending (doc 41).
+
+Backend order matches doc 18 preference: SIP-safe first.
+"""
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+CAP = 64 * 1024
+
+
+def cap_text(data):
+    if isinstance(data, bytes):
+        text = data.decode("utf-8", errors="replace")
+    else:
+        text = str(data)
+    if len(text) > CAP:
+        return text[:CAP] + "\n...[truncated]\n"
+    return text
+
+
+def exec_cmd(argv, timeout, extra_env=None):
+    """Run argv; always returns a result dict, never raises."""
+    t0 = time.monotonic()
+    try:
+        env = dict(os.environ)
+        env.update(extra_env or {})
+        proc = subprocess.run(argv, capture_output=True, timeout=timeout,
+                              env=env)
+        return {"exit": proc.returncode, "timeout": False,
+                "stdout": cap_text(proc.stdout),
+                "stderr": cap_text(proc.stderr),
+                "duration_ms": int((time.monotonic() - t0) * 1000)}
+    except FileNotFoundError:
+        return {"error": f"not found: {argv[0]}"}
+    except subprocess.TimeoutExpired as e:
+        out = (e.stdout or b"")
+        err = (e.stderr or b"")
+        if isinstance(out, str):
+            out = out.encode()
+        if isinstance(err, str):
+            err = err.encode()
+        return {"exit": None, "timeout": True,
+                "stdout": cap_text(out), "stderr": cap_text(err),
+                "duration_ms": int((time.monotonic() - t0) * 1000)}
+
+
+LLDB_FNS = ["open", "openat", "read", "write", "close", "mmap",
+            "munmap", "exit", "execve", "posix_spawn"]
+
+LLDB_SCRIPT = """\
+import lldb
+FNS = {fns!r}
+def __lldb_init_module(debugger, internal_dict):
+    target = debugger.GetSelectedTarget()
+    for fn in FNS:
+        bp = target.BreakpointCreateByName(fn)
+        bp.SetAutoContinue(True)
+        bp.SetScriptCallbackBody("print('HIT', frame.GetFunctionName() or '?')")
+"""
+
+
+def backend_dyld(argv, timeout):
+    if sys.platform != "darwin":
+        return {"status": "skipped", "reason": "darwin-only"}
+    res = exec_cmd(argv, timeout,
+                   {"DYLD_PRINT_LIBRARIES": "1",
+                    "DYLD_PRINT_STATISTICS": "1"})
+    if "error" in res:
+        return {"status": "error", "reason": res["error"]}
+    return {"status": "ok", "exit": res["exit"],
+            "output": cap_text(res["stderr"] or res["stdout"])}
+
+
+def backend_log(argv, timeout):
+    if sys.platform != "darwin":
+        return {"status": "skipped", "reason": "darwin-only"}
+    proc_name = os.path.basename(argv[0])
+    res = exec_cmd(["log", "show", "--last", "1m", "--style", "compact",
+                    "--predicate", f'process == "{proc_name}"'],
+                   min(timeout, 20))
+    if "error" in res:
+        return {"status": "error", "reason": res["error"]}
+    if res.get("timeout"):
+        return {"status": "error", "reason": "log show timed out"}
+    return {"status": "ok", "output": cap_text(res["stdout"])}
+
+
+def backend_lldb(argv, timeout, workdir):
+    if not shutil.which("lldb"):
+        return {"status": "skipped", "reason": "lldb not installed"}
+    script = Path(workdir) / "lldb_trace.py"
+    script.write_text(LLDB_SCRIPT.format(fns=LLDB_FNS))
+    res = exec_cmd(["lldb", "--batch", "-o",
+                    f"command script import {script}",
+                    "-o", "run", "-o", "quit", "--", *argv], timeout)
+    if "error" in res:
+        return {"status": "error", "reason": res["error"]}
+    transcript = (res["stdout"] or "") + "\n" + (res["stderr"] or "")
+    for marker in ("attach failed", "Not allowed to attach"):
+        if marker in transcript:
+            return {"status": "skipped",
+                    "reason": f"lldb attach denied ({marker})"}
+    if res["exit"] != 0:
+        return {"status": "error",
+                "reason": f"lldb exit {res['exit']}",
+                "output": cap_text(transcript)}
+    return {"status": "ok", "output": cap_text(transcript)}
+
+
+def backend_xctrace(argv, timeout, workdir):
+    if not shutil.which("xctrace"):
+        return {"status": "skipped", "reason": "xctrace not installed"}
+    trace = str(Path(workdir) / "run.trace")
+    res = exec_cmd(["xctrace", "record", "--template", "System Trace",
+                    "--output", trace, "--launch", "--", *argv], timeout)
+    if "error" in res:
+        return {"status": "error", "reason": res["error"]}
+    combined = (res["stderr"] or "") + (res["stdout"] or "")
+    if "requires Xcode" in combined:
+        return {"status": "skipped",
+                "reason": "xctrace shim needs full Xcode (CLT only)"}
+    if res.get("timeout") or res["exit"] != 0:
+        return {"status": "error",
+                "reason": f"xctrace exit {res['exit']}",
+                "output": cap_text(res["stderr"])}
+    # .trace parsing deferred to P1; the artifact path is the evidence.
+    return {"status": "ok", "trace": trace}
+
+
+def backend_dtruss(argv, timeout):
+    if os.geteuid() != 0:
+        return {"status": "skipped", "reason": "needs root"}
+    res = exec_cmd(["dtruss", "-f", *argv], timeout)
+    if "error" in res:
+        return {"status": "error", "reason": res["error"]}
+    return {"status": "ok" if not res.get("timeout") else "error",
+            "output": cap_text(res["stderr"] or res["stdout"])}
+
+
+def cmd_collect(args):
+    outdir = Path(args.out)
+    outdir.mkdir(parents=True, exist_ok=True)
+    if not args.command:
+        print("mol-trace: missing command after '--'", file=sys.stderr)
+        return 2
+    main = exec_cmd(args.command, args.timeout)
+    if "error" in main:
+        print(f"mol-trace: {main['error']}", file=sys.stderr)
+        return 1
+    backends = {"exec": {"status": "ok"}}
+    with tempfile.TemporaryDirectory(prefix="mol-trace-") as workdir:
+        runners = [
+            ("dyld", lambda: backend_dyld(args.command, args.timeout)),
+            ("log", lambda: backend_log(args.command, args.timeout)),
+            ("lldb", lambda: backend_lldb(args.command, args.timeout,
+                                          workdir)),
+            ("xctrace", lambda: backend_xctrace(args.command, args.timeout,
+                                                workdir)),
+            ("dtruss", lambda: backend_dtruss(args.command, args.timeout)),
+        ]
+        for name, fn in runners:
+            try:
+                backends[name] = fn()
+            except Exception as e:  # noqa: BLE001 - backends never crash us
+                backends[name] = {"status": "error",
+                                  "reason": f"{type(e).__name__}: {e}"}
+    doc = {"command": args.command, "exit": main["exit"],
+           "timeout": main["timeout"], "stdout": main["stdout"],
+           "stderr": main["stderr"], "duration_ms": main["duration_ms"],
+           "backends": backends}
+    with open(outdir / "trace.json", "w") as f:
+        json.dump(doc, f, indent=2, sort_keys=True)
+    states = ", ".join(f"{k}={v['status']}" for k, v in backends.items())
+    print(f"trace: exit={main['exit']} timeout={main['timeout']} [{states}]")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="mol-trace",
+                                 description="oracle trace collector")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("collect", help="run a command and trace it")
+    p.add_argument("--out", required=True)
+    p.add_argument("--timeout", type=int, default=120)
+    p.add_argument("command", nargs=argparse.REMAINDER,
+                   help="command after '--'")
+    args = ap.parse_args(argv)
+    if args.command and args.command[0] == "--":
+        args.command = args.command[1:]
+    return cmd_collect(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
