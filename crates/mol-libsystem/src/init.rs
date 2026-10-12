@@ -166,9 +166,16 @@ pub const EXPECTED_ORDER: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes the init tests: `run_init_order` registers into
+    /// the process-global atfork chain, so parallel inits inflate
+    /// each other's counts (caught on amd64).
+    static SERIAL: Mutex<()> = Mutex::new(());
 
     #[test]
     fn order_is_exact() {
+        let _g = SERIAL.lock().unwrap();
         let mut ctx = InitCtx::default();
         run_init_order(&mut ctx);
         assert_eq!(ctx.trace, EXPECTED_ORDER);
@@ -176,6 +183,7 @@ mod tests {
 
     #[test]
     fn errno_zeroed_and_atfork_set() {
+        let _g = SERIAL.lock().unwrap();
         mol_syscall::errcell::set(99);
         let before = atfork::len();
         let mut ctx = InitCtx::default();
@@ -190,6 +198,7 @@ mod tests {
 
     #[test]
     fn platform_facts_captured() {
+        let _g = SERIAL.lock().unwrap();
         let mut ctx = InitCtx::default();
         run_init_order(&mut ctx);
         assert!(ctx.page_size >= 0x1000 && ctx.page_size.is_power_of_two());
@@ -199,6 +208,7 @@ mod tests {
 
     #[test]
     fn dispatch_xpc_are_documented_stubs() {
+        let _g = SERIAL.lock().unwrap();
         let mut ctx = InitCtx::default();
         run_init_order(&mut ctx);
         assert!(ctx.dispatch_stub && ctx.xpc_stub);

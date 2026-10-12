@@ -95,10 +95,10 @@ fn chk_fail_dies_sigabrt() {
     let rc = mol_syscall::mol_posix_spawn(
         &mut pid,
         a0.as_ptr() as *const c_char,
+        core::ptr::null(),
+        core::ptr::null(),
         argvp.as_ptr(),
         envp.as_ptr(),
-        core::ptr::null(),
-        core::ptr::null(),
     );
     assert_eq!(rc, 0);
     let mut status: i32 = 0;

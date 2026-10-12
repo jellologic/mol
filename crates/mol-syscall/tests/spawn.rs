@@ -24,9 +24,9 @@ fn spawn_wait(file: &str, args: &[&str]) -> (i32, i32) {
     let rc = mol_syscall::mol_posix_spawn(
         &mut pid,
         f.as_ptr() as *const c_char,
+        core::ptr::null(),
+        core::ptr::null(),
         argvp.as_ptr(),
-        core::ptr::null(),
-        core::ptr::null(),
         core::ptr::null(),
     );
     assert_eq!(rc, 0, "spawn {file} failed: {:?}", name(rc));
@@ -67,9 +67,9 @@ fn spawn_errors_return_errno_not_cell() {
     let rc = mol_syscall::mol_posix_spawn(
         &mut pid,
         f.as_ptr() as *const c_char,
+        core::ptr::null(),
+        core::ptr::null(),
         argvp.as_ptr(),
-        core::ptr::null(),
-        core::ptr::null(),
         core::ptr::null(),
     );
     assert_eq!(rc, ENOENT, "name {:?}", name(rc));
@@ -88,9 +88,9 @@ fn spawn_rejects_non_smoke_args() {
         mol_syscall::mol_posix_spawn(
             &mut pid,
             f.as_ptr() as *const c_char,
-            argvp.as_ptr(),
-            core::ptr::null(),
             dummy.as_ptr() as *const u8,
+            core::ptr::null(),
+            argvp.as_ptr(),
             core::ptr::null(),
         ),
         EINVAL
@@ -100,10 +100,10 @@ fn spawn_rejects_non_smoke_args() {
         mol_syscall::mol_posix_spawn(
             &mut pid,
             f.as_ptr() as *const c_char,
-            argvp.as_ptr(),
-            core::ptr::null(),
             core::ptr::null(),
             dummy.as_ptr() as *const u8,
+            argvp.as_ptr(),
+            core::ptr::null(),
         ),
         EINVAL
     );
@@ -134,9 +134,9 @@ fn waitpid_wnohang_and_echild() {
         mol_syscall::mol_posix_spawn(
             &mut pid,
             f.as_ptr() as *const c_char,
+            core::ptr::null(),
+            core::ptr::null(),
             argvp.as_ptr(),
-            core::ptr::null(),
-            core::ptr::null(),
             core::ptr::null(),
         ),
         0
@@ -164,9 +164,9 @@ fn waitpid_wnohang_and_echild() {
         mol_syscall::mol_posix_spawn(
             &mut pid,
             f.as_ptr() as *const c_char,
+            core::ptr::null(),
+            core::ptr::null(),
             argvp.as_ptr(),
-            core::ptr::null(),
-            core::ptr::null(),
             core::ptr::null(),
         ),
         0
@@ -213,9 +213,9 @@ fn macho_target_dispatches_to_loader_override() {
     let rc = mol_syscall::mol_posix_spawn(
         &mut pid,
         f.as_ptr() as *const c_char,
+        core::ptr::null(),
+        core::ptr::null(),
         argvp.as_ptr(),
-        core::ptr::null(),
-        core::ptr::null(),
         core::ptr::null(),
     );
     std::env::remove_var("MOL_SPAWN_LOADER");

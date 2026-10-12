@@ -168,13 +168,15 @@ pub extern "C" fn mol_sigaction(
 pub extern "C" fn mol_posix_spawn(
     pid: *mut i32,
     path: *const c_char,
-    argv: *const *const c_char,
-    envp: *const *const c_char,
     file_actions: *const u8,
     attrp: *const u8,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
 ) -> c_int {
     // POSIX: returns the errno number directly, never sets errno.
-    match spawn::posix_spawn(pid, path, argv, envp, file_actions, attrp) {
+    // Arg order is the Darwin/POSIX one: (pid, path, actions,
+    // attrp, argv, envp).
+    match spawn::posix_spawn(pid, path, file_actions, attrp, argv, envp) {
         Ok(_) => 0,
         Err(no) => no,
     }

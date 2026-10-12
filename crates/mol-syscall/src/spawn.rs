@@ -114,10 +114,10 @@ fn write_all(fd: i64, buf: &[u8]) {
 pub fn posix_spawn(
     pid_out: *mut i32,
     path: *const c_char,
-    argv: *const *const c_char,
-    envp: *const *const c_char,
     file_actions: *const u8,
     attrp: *const u8,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
 ) -> Result<i32, i32> {
     use crate::raw;
     if !file_actions.is_null() || !attrp.is_null() {
