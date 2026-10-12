@@ -31,3 +31,23 @@ Tests:
 - [x] P1.2.V2 ulp-envelope measurement suite built from oracle
   traces; envelope checked in as the comparator (docs 11 F3, 14).
   (`tools/ulp-oracle.c` -> `corpus/ulp/` -> `tests/ulp.rs`.)
+
+Closeout notes (CI green both arches, run 38314993817):
+
+- T6 postmortem: hand-written x86_64 guests called shims with
+  `rsp % 16 == 8` at the call; `posix_spawn` / `inherit_env`
+  `movaps (%rsp)` spills then #GP on real hardware (SIGSEGV with
+  `SI_KERNEL`, code 128, addr 0 — not a page fault). Local amd64
+  docker runs under Rosetta, which emulates through unaligned
+  `movaps`, so only CI faulted. Fix: `x_sub_rsp_8` prologue as
+  first emission in every x86_64 guest, enforced by a static
+  guard in `build_import_guest`. Rule for all future guests:
+  entry gives `rsp % 16 == 8`; align before the first call.
+- `--debug-catch-faults`: raw-syscall SIGSEGV/SIGBUS/SIGILL
+  reporter (signal/code/addr/pc) installed after libSystem init;
+  ucontext PC offsets verified live (x86_64 168, aarch64 440).
+  Pinned by `fault_catcher_reports_segv`; decoded the T6 #GP.
+- Parser hardening (P1.1 code, fixed during P1.2): libFuzzer
+  `parse_file` found `fileoff + filesize` overflow panics on
+  hostile u64 geometry; audit fixed 7 sites (map/chained/lib/
+  cursor) with 5 regression tests. See doc 42 V2 note.

@@ -84,4 +84,7 @@ Exit evidence:
 - P1.1.V2: `tools/fuzz-afl.sh` (AFL++ 150s clean; found and fixed
   a real iterator-fuse hang first) and `tools/fuzz-libfuzzer.sh`
   (4 cargo-fuzz targets × 60s clean), both gated in the CI `fuzz`
-  job from this commit forward.
+  job from this commit forward. Later catch (fixed during P1.2):
+  `parse_file` found u64 range-check overflow panics
+  (`fileoff + filesize` et al. on hostile geometry); audit fixed
+  7 sites with 5 regression tests, no corpus change needed.
