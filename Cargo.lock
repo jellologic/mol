@@ -30,7 +30,9 @@ name = "mol-loader"
 version = "0.1.0"
 dependencies = [
  "mol-dyld",
+ "mol-libsystem",
  "mol-macho",
+ "mol-syscall",
 ]
 
 [[package]]

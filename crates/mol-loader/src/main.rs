@@ -189,7 +189,8 @@ fn help_text() -> &'static str {
      \x20     merged view at <prefix>/merged, init exec'd as PID 1 (upper/work need overlay-capable fs)\n\
      \x20 run [--sysroot S] [--slide N] [--stack-size N] <mach-o> [args...]\n\
      \x20     run a same-ISA Mach-O guest in-process (Linux-only);\n\
-     \x20     --slide pins ASLR (hex or decimal, default random)\n"
+     \x20     --slide pins the main image slide (dylibs always random;\n\
+     \x20     hex or decimal, default random)\n"
 }
 
 fn resolve_spec(args: &BootArgs) -> Result<PrefixSpec, String> {

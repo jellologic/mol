@@ -312,10 +312,51 @@ impl<'a> ImageStore<'a> for FsStore {
     }
 }
 
-/// Random per-image ASLR slides (1MB granularity, 1..255MB).
-/// Never zero: zero-base images (dylibs link at 0, as does the mol
-/// shim) would otherwise map below `vm.mmap_min_addr` (64K) and fail
-/// with EPERM for non-root users.
+/// Whether `path` names the libSystem shim (bare or sysroot-joined).
+fn is_shim_path(path: &str) -> bool {
+    path == mol_libsystem::shim::SHIM_PATH || path.ends_with(mol_libsystem::shim::SHIM_PATH)
+}
+
+/// File store with the generated `libSystem.B.dylib` shim overlaid:
+/// guests link the shim path and always get mol's generated image
+/// (a real Apple libSystem could never run on Linux — it traps — so
+/// the overlay takes precedence over any same-path file).
+pub struct ShimStore {
+    inner: FsStore,
+    shim: Option<&'static [u8]>,
+}
+
+impl ShimStore {
+    pub fn new(sysroot: &str) -> Self {
+        ShimStore {
+            inner: FsStore::new(sysroot),
+            shim: None,
+        }
+    }
+}
+
+impl<'a> ImageStore<'a> for ShimStore {
+    fn bytes(&mut self, path: &str) -> Option<&'a [u8]> {
+        if is_shim_path(path) {
+            if self.shim.is_none() {
+                let fat = mol_libsystem::shim::build_shim(&mol_libsystem::exports());
+                self.shim = Some(Box::leak(fat.into_boxed_slice()));
+            }
+            return self.shim;
+        }
+        self.inner.bytes(path)
+    }
+}
+
+/// Random per-image ASLR slides (1MB granularity). Mains slide in
+/// `[1MB, 255MB]`; dylibs slide in `[5GB+1MB, 5GB+255MB]`, mirroring
+/// Apple's ~6GB shared-cache placement. The split is load-bearing:
+/// the main image's 4GB `__PAGEZERO` reservation covers low VA, so
+/// low-slid dylibs would collide with it on every attempt
+/// (`SlideExhausted`). Slides are never zero: zero-base images
+/// (dylibs link at 0, as does the mol shim) would otherwise map
+/// below `vm.mmap_min_addr` (64K) and fail with EPERM for non-root
+/// users.
 pub struct RandomSlide;
 
 impl SlidePolicy for RandomSlide {
@@ -324,10 +365,39 @@ impl SlidePolicy for RandomSlide {
             return 0;
         }
         let mut buf = [0u8; 8];
-        if sys::getrandom(&mut buf).is_err() {
-            return 0x10_0000;
+        let rand1_255 = if sys::getrandom(&mut buf).is_err() {
+            1
+        } else {
+            u64::from_ne_bytes(buf) % 255 + 1
+        };
+        if is_main {
+            rand1_255 * 0x10_0000
+        } else {
+            0x1_4000_0000 + rand1_255 * 0x10_0000
         }
-        (u64::from_ne_bytes(buf) % 255 + 1) * 0x10_0000
+    }
+}
+
+/// Fixed slide for the main image, random slides for dylibs (used
+/// for `--slide`). Dylibs link at 0 and can never map at a low fixed
+/// slide on Linux (`mmap_min_addr`); macOS likewise always slides
+/// dylibs even when the main image is fixed.
+struct FixedMainSlide {
+    main_slide: u64,
+    random: RandomSlide,
+}
+
+impl SlidePolicy for FixedMainSlide {
+    fn slide_for(&mut self, path: &str, is_main: bool, is_pie: bool) -> u64 {
+        if is_main {
+            if is_pie {
+                self.main_slide
+            } else {
+                0
+            }
+        } else {
+            self.random.slide_for(path, is_main, is_pie)
+        }
     }
 }
 
@@ -343,7 +413,8 @@ pub struct RunOptions {
     pub envp: Vec<String>,
     /// Prefix merged dir guest absolute paths resolve under.
     pub sysroot: String,
-    /// Fixed slide for every image (`None` = random ASLR).
+    /// Fixed slide for the main image (`None` = random ASLR).
+    /// Dylib slides are always random.
     pub fixed_slide: Option<u64>,
     /// Guest stack size in bytes.
     pub stack_size: u64,
@@ -380,13 +451,62 @@ fn vm_to_host_prot(initprot: u32) -> u64 {
 // mapping
 // ---------------------------------------------------------------------------
 
+/// Reservation holes: zero-filesize segments minus the image's own
+/// content ranges (slid). A reservation (e.g. `__PAGEZERO`) covers
+/// VA the image's own later segments may overlap (zero-linked
+/// mains); mapping the full reservation with `NOREPLACE` would
+/// self-collide, so only the holes are reserved.
+fn reservation_holes(map: &mol_macho::map::LoadMap, slide: u64) -> Vec<(u64, u64)> {
+    let mut content: Vec<(u64, u64)> = Vec::new();
+    for seg in &map.segments {
+        if seg.vmsize != 0 && seg.filesize != 0 {
+            content.push((seg.vmaddr.wrapping_add(slide), seg.vmsize));
+        }
+    }
+    let mut holes = Vec::new();
+    for seg in &map.segments {
+        if seg.vmsize == 0 || seg.filesize != 0 {
+            continue;
+        }
+        let mut cur = seg.vmaddr.wrapping_add(slide);
+        let end = cur.wrapping_add(seg.vmsize);
+        // Subtract content ranges (segments are few; O(n*m) is fine).
+        let mut spans = vec![(cur, end)];
+        for (caddr, clen) in &content {
+            let cend = caddr.wrapping_add(*clen);
+            let mut next = Vec::new();
+            for (s, e) in spans {
+                if *caddr >= e || cend <= s {
+                    next.push((s, e));
+                    continue;
+                }
+                if *caddr > s {
+                    next.push((s, *caddr));
+                }
+                if cend < e {
+                    next.push((cend, e));
+                }
+            }
+            spans = next;
+        }
+        for (s, e) in spans {
+            if e > s {
+                cur = s;
+                holes.push((cur, e - s));
+            }
+        }
+    }
+    holes
+}
+
 /// Map one image's segments at `vmaddr + slide` with read/write so
 /// file bytes and fixups can be applied. Returns mapped ranges for
 /// cleanup on retry.
 fn map_image(bytes: &[u8], map: &mol_macho::map::LoadMap, slide: u64) -> Result<Vec<(u64, u64)>> {
     let mut mapped = Vec::new();
+    // Pass 1: content segments.
     for seg in &map.segments {
-        if seg.vmsize == 0 {
+        if seg.vmsize == 0 || seg.filesize == 0 {
             continue;
         }
         if seg.filesize > seg.vmsize {
@@ -395,18 +515,6 @@ fn map_image(bytes: &[u8], map: &mol_macho::map::LoadMap, slide: u64) -> Result<
             });
         }
         let addr = seg.vmaddr.wrapping_add(slide);
-        if seg.filesize == 0 {
-            // Reservation (e.g. __PAGEZERO): no access, no bytes.
-            sys::mmap_fixed(addr, seg.vmsize, sys::PROT_NONE, true).map_err(|errno| {
-                RunError::Mmap {
-                    addr,
-                    len: seg.vmsize,
-                    errno,
-                }
-            })?;
-            mapped.push((addr, seg.vmsize));
-            continue;
-        }
         sys::mmap_fixed(addr, seg.vmsize, sys::PROT_READ | sys::PROT_WRITE, true).map_err(
             |errno| RunError::Mmap {
                 addr,
@@ -429,6 +537,15 @@ fn map_image(bytes: &[u8], map: &mol_macho::map::LoadMap, slide: u64) -> Result<
         unsafe {
             std::ptr::copy_nonoverlapping(src.as_ptr(), addr as *mut u8, src_len);
         }
+    }
+    // Pass 2: reservation holes (no access, no bytes).
+    for (addr, len) in reservation_holes(map, slide) {
+        sys::mmap_fixed(addr, len, sys::PROT_NONE, true).map_err(|errno| RunError::Mmap {
+            addr,
+            len,
+            errno,
+        })?;
+        mapped.push((addr, len));
     }
     Ok(mapped)
 }
@@ -460,18 +577,68 @@ fn apply_fixups(plan: &[fixups::FixupApply]) -> Result<()> {
     Ok(())
 }
 
+/// Fill the shim's `__data` slots with handler addresses (and the
+/// stack-guard value). Runs after fixups, before `mprotect`, while
+/// every mapping is still writable. Images that link no shim are
+/// unaffected.
+fn fill_shim_slots(set: &LinkedSet) -> Result<()> {
+    use mol_libsystem::shim::slot_addr;
+    let exports = mol_libsystem::exports();
+    mol_syscall::chk::init_guard();
+    for img in &set.images {
+        if !is_shim_path(&img.path) {
+            continue;
+        }
+        let data = img
+            .map
+            .segments
+            .iter()
+            .find(|s| s.segname == "__DATA")
+            .ok_or(RunError::BadSegment {
+                segname: format!("{} has no __DATA", img.path),
+            })?;
+        for (i, e) in exports.iter().enumerate() {
+            let value = mol_libsystem::resolve(e.name).ok_or(RunError::Link(
+                mol_dyld::LinkError::SymbolNotFound {
+                    needed_by: img.path.clone(),
+                    symbol: e.name.to_string(),
+                },
+            ))?;
+            // Slot addresses derive from the segment (robust to
+            // generator layout changes); the index order is ABI.
+            let at = data
+                .vmaddr
+                .wrapping_add(img.slide)
+                .wrapping_add(slot_addr(i) - mol_libsystem::shim::DATA_VMADDR);
+            // SAFETY: our fresh mapping, sized for the slot run.
+            unsafe {
+                std::ptr::write_unaligned(at as *mut u64, value.to_le());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Drop each segment to its `initprot` and flush executable caches.
+/// Reservations go first so page-rounding overlap resolves in favor
+/// of content (a hole sharing a host page with a segment must not
+/// strip that segment's protections).
 fn protect_image(map: &mol_macho::map::LoadMap, slide: u64, page: u64) -> Result<()> {
+    for (addr, len) in reservation_holes(map, slide) {
+        let start = addr & !(page - 1);
+        let end = (addr + len + page - 1) & !(page - 1);
+        sys::mprotect(start, end - start, sys::PROT_NONE).map_err(|errno| RunError::Mprotect {
+            addr: start,
+            len: end - start,
+            errno,
+        })?;
+    }
     for seg in &map.segments {
-        if seg.vmsize == 0 {
+        if seg.vmsize == 0 || seg.filesize == 0 {
             continue;
         }
         let addr = seg.vmaddr.wrapping_add(slide);
-        let prot = if seg.filesize == 0 {
-            sys::PROT_NONE
-        } else {
-            vm_to_host_prot(seg.initprot)
-        };
+        let prot = vm_to_host_prot(seg.initprot);
         // Round the range out to host pages.
         let start = addr & !(page - 1);
         let end = (addr + seg.vmsize + page - 1) & !(page - 1);
@@ -480,7 +647,7 @@ fn protect_image(map: &mol_macho::map::LoadMap, slide: u64, page: u64) -> Result
             len: end - start,
             errno,
         })?;
-        if seg.filesize != 0 && prot & sys::PROT_EXEC != 0 {
+        if prot & sys::PROT_EXEC != 0 {
             // SAFETY: range is mapped readable+writable here... but
             // mprotect already dropped write. clear_cache only reads
             // (data clean) and issues icache maintenance by address.
@@ -677,7 +844,7 @@ pub fn run_guest(path: &str, opts: &RunOptions) -> Result<()> {
     let main_bytes =
         std::fs::read(path).map_err(|e| RunError::Io(format!("cannot read {path}: {e}")))?;
     check_host_slice(&main_bytes)?;
-    let mut store = FsStore::new(&opts.sysroot);
+    let mut store = ShimStore::new(&opts.sysroot);
     // Closure inputs from the launch environment (doc 12 L3).
     let mut overrides = Vec::new();
     let mut interposing = false;
@@ -721,7 +888,10 @@ pub fn run_guest(path: &str, opts: &RunOptions) -> Result<()> {
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        let mut fixed = opts.fixed_slide.map(mol_dyld::load::FixedSlide);
+        let mut fixed = opts.fixed_slide.map(|s| FixedMainSlide {
+            main_slide: s,
+            random: RandomSlide,
+        });
         let mut random = RandomSlide;
         let slides: &mut dyn SlidePolicy = match &mut fixed {
             Some(f) => f,
@@ -755,6 +925,7 @@ pub fn run_guest(path: &str, opts: &RunOptions) -> Result<()> {
                 },
             )?;
             apply_fixups(&plan)?;
+            fill_shim_slots(&set)?;
             let page = page_size() as u64;
             for img in &set.images {
                 protect_image(&img.map, img.slide, page)?;
@@ -791,6 +962,9 @@ pub fn run_guest(path: &str, opts: &RunOptions) -> Result<()> {
                 }
                 let inits = init::order_initializers(&set);
                 let fns: Vec<u64> = inits.iter().map(|i| i.address).collect();
+                // libSystem bring-up before guest initializers (P1.2.1).
+                let mut ictx = mol_libsystem::init::InitCtx::default();
+                mol_libsystem::init::run_init_order(&mut ictx);
                 let record = RunRecord {
                     cache_mode: decision.mode,
                     reason: decision.reason,
@@ -798,6 +972,7 @@ pub fn run_guest(path: &str, opts: &RunOptions) -> Result<()> {
                     fixups_applied: plan.len(),
                     pac_stripped: plan.iter().filter(|a| a.stripped_pac).count(),
                     pac_available: pac_available(),
+                    init_trace: ictx.trace.iter().map(|s| s.to_string()).collect(),
                 };
                 eprint!("{}", record.render());
                 // Entry register values: argc count + pointers to
@@ -819,12 +994,12 @@ pub fn run_guest(path: &str, opts: &RunOptions) -> Result<()> {
                     )
                 }
             }
-            Err(RunError::Mmap { errno: 17, .. })
-                if opts.fixed_slide.is_none() && attempt < SLIDE_ATTEMPTS =>
-            {
-                // EEXIST under ASLR: occupied range; retry with fresh
-                // slides. Fixed slides fail immediately instead of
-                // pointlessly remapping the same addresses.
+            Err(RunError::Mmap { errno: 17, .. }) if attempt < SLIDE_ATTEMPTS => {
+                // EEXIST: occupied range; retry with fresh slides.
+                // Dylib slides are always random (even under
+                // `--slide`), so a dylib collision can clear on
+                // retry; a fixed-main collision fails deterministically
+                // after SLIDE_ATTEMPTS.
                 unmap_all(&mapped);
                 continue;
             }
@@ -849,6 +1024,18 @@ fn entry_args(sp: u64, argc: usize, envc: usize) -> (u64, u64, u64, u64) {
 mod tests {
     use super::*;
     use mol_macho::codesign::{CS_ADHOC, CS_PLATFORM_BINARY, CS_REQUIRE_LV, CS_RUNTIME, CS_VALID};
+
+    #[test]
+    fn fixed_main_slide_pins_main_only() {
+        let mut p = FixedMainSlide {
+            main_slide: 0x2000,
+            random: RandomSlide,
+        };
+        assert_eq!(p.slide_for("/m", true, true), 0x2000);
+        assert_eq!(p.slide_for("/m", true, false), 0);
+        let d = p.slide_for("/d", false, false);
+        assert!(d >= 0x1_4000_0000 + 0x10_0000 && d <= 0x1_4000_0000 + 255 * 0x10_0000);
+    }
 
     #[test]
     fn entry_args_match_stack_layout() {
@@ -961,5 +1148,61 @@ mod tests {
     fn page_size_sane() {
         let p = page_size();
         assert!(p >= 0x1000 && p.is_power_of_two());
+    }
+
+    #[test]
+    fn reservation_holes_subtract_own_content() {
+        use mol_macho::map::{LoadMap, MapSegment};
+        fn seg(name: &str, vmaddr: u64, vmsize: u64, filesize: u64) -> MapSegment {
+            MapSegment {
+                segname: name.to_string(),
+                vmaddr,
+                vmsize,
+                fileoff: 0,
+                filesize,
+                maxprot: 0,
+                initprot: 0,
+                flags: 0,
+                sections: Vec::new(),
+            }
+        }
+        fn map_with(segments: Vec<MapSegment>) -> LoadMap {
+            LoadMap {
+                cputype: 0,
+                cpusubtype: 0,
+                filetype: 0,
+                flags: 0,
+                slide: 0,
+                segments,
+                entry: None,
+                routines: Vec::new(),
+                dylinker: None,
+                dylibs: Vec::new(),
+                uuid: None,
+                build: None,
+                codesign: None,
+                exports: Vec::new(),
+                fixups: Vec::new(),
+                unknown_cmds: Vec::new(),
+            }
+        }
+        // Zero-linked main: PAGEZERO [0, 4GB) with TEXT/DATA inside.
+        let map = map_with(vec![
+            seg("__PAGEZERO", 0, 0x1_0000_0000, 0),
+            seg("__TEXT", 0x1000, 0x3000, 0x3000),
+            seg("__DATA", 0x5000, 0x1000, 0x1000),
+        ]);
+        let holes = reservation_holes(&map, 0x10_0000);
+        assert_eq!(
+            holes,
+            vec![
+                (0x10_0000, 0x1000),                 // [slide, TEXT)
+                (0x10_4000, 0x1000),                 // (TEXT, DATA)
+                (0x10_6000, 0x1_0000_0000 - 0x6000), // [DATA end, 4GB)
+            ]
+        );
+        // No reservations: no holes.
+        let map = map_with(vec![seg("__TEXT", 0x1000, 0x3000, 0x3000)]);
+        assert!(reservation_holes(&map, 0).is_empty());
     }
 }

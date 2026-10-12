@@ -143,6 +143,8 @@ pub struct RunRecord {
     pub fixups_applied: usize,
     pub pac_stripped: usize,
     pub pac_available: bool,
+    /// libSystem init order trace (P1.2.1; empty when init is skipped).
+    pub init_trace: Vec<String>,
 }
 
 impl RunRecord {
@@ -159,6 +161,9 @@ impl RunRecord {
         s.push_str(&format!("fixups_applied: {}\n", self.fixups_applied));
         s.push_str(&format!("pac_stripped: {}\n", self.pac_stripped));
         s.push_str(&format!("pac_available: {}\n", self.pac_available));
+        if !self.init_trace.is_empty() {
+            s.push_str(&format!("init: {}\n", self.init_trace.join(" -> ")));
+        }
         s
     }
 }

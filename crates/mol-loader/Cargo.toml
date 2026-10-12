@@ -10,6 +10,8 @@ repository.workspace = true
 [dependencies]
 mol-macho = { version = "0.1.0", path = "../mol-macho" }
 mol-dyld = { version = "0.1.0", path = "../mol-dyld" }
+mol-libsystem = { version = "0.1.0", path = "../mol-libsystem" }
+mol-syscall = { version = "0.1.0", path = "../mol-syscall" }
 
 [package.metadata.deb]
 name = "mol-loader"
