@@ -16,7 +16,13 @@ Criteria:
   (doc 12 L4). (`mol-objc` schedule/drain per `objc-loadmethod.mm`;
   loader drains mapped-memory parses between inits and entry via
   the `call_imp` trampoline.)
-- [ ] P1.3.2 Swift runtime dylibs load and initialize (doc 09 M1).
+- [x] P1.3.2 Swift runtime dylibs load and initialize (doc 09 M1).
+  (Swift-shaped dylib: `__swift5_proto` + Swift class `+load` +
+  `LC_ROUTINES_64` init + mangled export; `swift_dylib` E2E
+  asserts exact `SWFE` stdout + exit 0 on both arches. Fixed a
+  test-emitter bug along the way: `exports_trie` omitted the
+  leaf child-count byte, which single-export tries expose as
+  `Truncated { need: 25, len: 24 }`.)
 - [ ] P1.3.3 `objc_msgSend` ABI differential-clean incl nil-receiver,
   stret/fpret variants, and ARC entry points (`objc_retain` /
   `objc_release` / autorelease pools) (doc 03).

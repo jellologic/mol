@@ -613,9 +613,13 @@ pub fn x_ret(out: &mut Vec<u8>) {
 
 pub const MH_MAGIC_64: u32 = 0xfeed_facf;
 pub const MH_EXECUTE: u32 = 2;
+pub const MH_DYLIB: u32 = 6;
 pub const MH_PIE: u32 = 0x20_0000;
 pub const LC_SEGMENT_64: u32 = 0x19;
 pub const LC_LOAD_DYLIB: u32 = 0xc;
+pub const LC_ID_DYLIB: u32 = 0xd;
+pub const LC_ROUTINES_64: u32 = 0x1a;
+pub const LC_DYLD_EXPORTS_TRIE: u32 = 0x8000_0033;
 pub const LC_DYLD_CHAINED_FIXUPS: u32 = 0x8000_0034;
 pub const LC_MAIN: u32 = 0x8000_0028;
 
@@ -700,21 +704,141 @@ pub fn dylib_cmd(name: &str) -> Vec<u8> {
     cmd(LC_LOAD_DYLIB, &payload)
 }
 
+pub fn id_cmd(name: &str) -> Vec<u8> {
+    let mut payload = vec![0u8; 16];
+    payload[0..4].copy_from_slice(&24u32.to_le_bytes());
+    payload.extend_from_slice(name.as_bytes());
+    payload.push(0);
+    cmd(LC_ID_DYLIB, &payload)
+}
+
+pub fn routines_cmd(init_address: u64) -> Vec<u8> {
+    let mut payload = vec![0u8; 16];
+    payload[0..8].copy_from_slice(&init_address.to_le_bytes());
+    cmd(LC_ROUTINES_64, &payload)
+}
+
+/// ULEB128 for exports-trie emission.
+pub fn uleb(mut v: u64, out: &mut Vec<u8>) {
+    loop {
+        let mut b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v != 0 {
+            b |= 0x80;
+        }
+        out.push(b);
+        if v == 0 {
+            break;
+        }
+    }
+}
+
+/// Minimal exports trie: flat root with one edge per export.
+/// `address` is the image-base-relative offset (resolve adds
+/// base + slide; base-0 dylibs store plain link VAs).
+pub fn exports_trie(exports: &[(&str, u64)]) -> Vec<u8> {
+    assert!(exports.len() < 256, "too many exports");
+    // Children first (positions depend on root size): iterate the
+    // root layout to a fixed point (uleb widths settle at once).
+    let mut child_nodes = Vec::new();
+    for (_, addr) in exports {
+        let mut term = Vec::new();
+        uleb(0, &mut term); // flags: regular
+        uleb(*addr, &mut term);
+        let mut node = Vec::new();
+        uleb(term.len() as u64, &mut node);
+        node.extend_from_slice(&term);
+        node.push(0); // childCount = 0 (leaf; dyld nodes always carry this byte)
+        child_nodes.push(node);
+    }
+    let mut root_len = 2usize;
+    loop {
+        let mut r = vec![0u8]; // root terminalSize = 0
+        r.push(exports.len() as u8);
+        let mut at = root_len;
+        for (i, (name, _)) in exports.iter().enumerate() {
+            r.extend_from_slice(name.as_bytes());
+            r.push(0);
+            uleb(at as u64, &mut r);
+            at += child_nodes[i].len();
+        }
+        if r.len() == root_len {
+            let mut out = r;
+            for node in &child_nodes {
+                out.extend_from_slice(node);
+            }
+            return out;
+        }
+        root_len = r.len();
+    }
+}
+
 /// Chained-fixups payload: format 6, imports format 1, one bind per
 /// import at GOT slot `i` (stride-correct `next`, mirroring real
 /// `ld` emission: consecutive 8-byte binds use next=2).
 pub fn chained_payload(imports: &[&str]) -> (Vec<u8>, Vec<u8>) {
-    let n = imports.len();
-    // GOT chain entries.
+    let libs: Vec<(&str, u32)> = imports.iter().map(|s| (*s, 1)).collect();
+    let (p, patches) = chained_payload_full(&libs, &[]);
     let mut got = Vec::new();
-    for i in 0..n {
-        let next = if i + 1 < n { 2u64 } else { 0 };
-        got.extend_from_slice(&((i as u64) | (next << 51) | (1u64 << 63)).to_le_bytes());
+    for (off, enc) in &patches {
+        assert_eq!(*off as usize, got.len(), "binds must pack the GOT");
+        got.extend_from_slice(&enc.to_le_bytes());
+    }
+    (p, got)
+}
+
+/// One rebase site: page offset + link-time pointer value (< 2^36,
+/// the exact range of the 36+8 split encoding).
+pub struct RebaseSite {
+    pub off: u64,
+    pub value: u64,
+}
+
+/// General chained payload: per-import lib ordinals plus rebase
+/// sites merged into one ascending page-0 chain. Returns the
+/// payload plus `(page_off, encoded_entry)` patches to splice
+/// into the page (binds pack GOT slots `0..n*8` first).
+pub fn chained_payload_full(
+    imports: &[(&str, u32)],
+    rebases: &[RebaseSite],
+) -> (Vec<u8>, Vec<(u64, u64)>) {
+    let n = imports.len();
+    // Chain links in ascending page-offset order.
+    enum Link {
+        Bind(u64),
+        Rebase(u64),
+    }
+    let mut links: Vec<(u64, Link)> = Vec::new();
+    for (i, _) in imports.iter().enumerate() {
+        links.push((i as u64 * 8, Link::Bind(i as u64)));
+    }
+    for r in rebases {
+        assert!(r.value < (1u64 << 36), "rebase value out of range");
+        links.push((r.off, Link::Rebase(r.value)));
+    }
+    links.sort_by_key(|(off, _)| *off);
+    for w in links.windows(2) {
+        assert!(w[1].0 > w[0].0, "chain offsets must be distinct");
+        assert_eq!((w[1].0 - w[0].0) % 4, 0, "chain stride must divide 4");
+    }
+    let mut patches = Vec::new();
+    for (i, (off, link)) in links.iter().enumerate() {
+        let next = if i + 1 < links.len() {
+            (links[i + 1].0 - off) / 4
+        } else {
+            0
+        };
+        assert!(next <= 0xfff, "chain gap too large");
+        let enc = match link {
+            Link::Bind(ord) => ord | (next << 51) | (1u64 << 63),
+            Link::Rebase(v) => (v & 0xf_ffff_ffff) | (next << 51),
+        };
+        patches.push((*off, enc));
     }
     // Symbols.
     let mut symbols = Vec::new();
     let mut name_offs = Vec::new();
-    for name in imports {
+    for (name, _) in imports {
         name_offs.push(symbols.len() as u32);
         symbols.extend_from_slice(name.as_bytes());
         symbols.push(0);
@@ -726,7 +850,10 @@ pub fn chained_payload(imports: &[&str]) -> (Vec<u8>, Vec<u8>) {
     p.extend_from_slice(&2u32.to_le_bytes());
     p.extend_from_slice(&0u32.to_le_bytes());
     p.extend_from_slice(&(info_rel as u32).to_le_bytes());
-    let first = if n > 0 { 0u16 } else { 0xffffu16 };
+    let first = links
+        .first()
+        .map(|(off, _)| *off as u16)
+        .unwrap_or(0xffffu16);
     let mut seg = vec![0u8; 24];
     seg[0..4].copy_from_slice(&24u32.to_le_bytes());
     seg[4..6].copy_from_slice(&0x4000u16.to_le_bytes());
@@ -735,9 +862,8 @@ pub fn chained_payload(imports: &[&str]) -> (Vec<u8>, Vec<u8>) {
     seg[22..24].copy_from_slice(&first.to_le_bytes());
     p.extend_from_slice(&seg);
     let imports_off = p.len() as u32;
-    for (i, _) in imports.iter().enumerate() {
-        // lib 1 (first LC_LOAD_DYLIB), not weak.
-        let w = 1u32 | (name_offs[i] << 9);
+    for (i, (_, lib)) in imports.iter().enumerate() {
+        let w = lib | (name_offs[i] << 9);
         p.extend_from_slice(&w.to_le_bytes());
     }
     let symbols_off = p.len() as u32;
@@ -748,7 +874,7 @@ pub fn chained_payload(imports: &[&str]) -> (Vec<u8>, Vec<u8>) {
     p[12..16].copy_from_slice(&symbols_off.to_le_bytes());
     p[16..20].copy_from_slice(&(n as u32).to_le_bytes());
     p[20..24].copy_from_slice(&1u32.to_le_bytes());
-    (p, got)
+    (p, patches)
 }
 
 /// Build an import-calling guest: `code` runs at the entry point,
@@ -757,6 +883,20 @@ pub fn build_import_guest(
     cputype: u32,
     cpusubtype: u32,
     imports: &[&str],
+    code: &[u8],
+    data: &[u8],
+) -> Vec<u8> {
+    let libs: Vec<(&str, u32)> = imports.iter().map(|s| (*s, 1)).collect();
+    build_import_guest_full(cputype, cpusubtype, &[SHIM_PATH], &libs, code, data)
+}
+
+/// General form: `dylibs` in ordinal order (1-based), imports with
+/// per-import lib ordinals.
+pub fn build_import_guest_full(
+    cputype: u32,
+    cpusubtype: u32,
+    dylibs: &[&str],
+    imports: &[(&str, u32)],
     code: &[u8],
     data: &[u8],
 ) -> Vec<u8> {
@@ -769,15 +909,22 @@ pub fn build_import_guest(
         code.len() >= 4 && code[..4] == [0x48, 0x83, 0xec, 0x08],
         "x86_64 guest must start with x_sub_rsp_8 prologue"
     );
-    let (chained, got) = chained_payload(imports);
+    let (chained, patches) = chained_payload_full(imports, &[]);
+    let mut got = Vec::new();
+    for (off, enc) in &patches {
+        assert_eq!(*off as usize, got.len(), "binds must pack the GOT");
+        got.extend_from_slice(&enc.to_le_bytes());
+    }
     assert!(32 + 512 + chained.len() < CHAIN_OFF as usize + 0x1000);
     let data_len = got.len() + data.len();
     assert!(data_len <= 0x4000, "data too large");
     let mut cmds = vec![
         segment("__TEXT", TEXT_VMADDR, 0, 0x4000, 0x4000, 5),
         segment("__DATA", DATA_VMADDR, 0x4000, data_len as u64, 0x4000, 3),
-        dylib_cmd(SHIM_PATH),
     ];
+    for d in dylibs {
+        cmds.push(dylib_cmd(d));
+    }
     let mut fix = vec![0u8; 8];
     fix[0..4].copy_from_slice(&(CHAIN_OFF as u32).to_le_bytes());
     fix[4..8].copy_from_slice(&(chained.len() as u32).to_le_bytes());
